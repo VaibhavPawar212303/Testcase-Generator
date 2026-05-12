@@ -97,26 +97,25 @@ export default function Page() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const fetchKnowledge = async () => {
+  const fetchKnowledge = () => {
+    if (typeof window === 'undefined') return;
     try {
-      const res = await fetch('/api/knowledge');
-      const data = await res.json();
-      setKnowledgeBase(data.documents || []);
+      const stored = localStorage.getItem('knowledge_base');
+      if (stored) {
+        setKnowledgeBase(JSON.parse(stored));
+      }
     } catch (e) {
-      console.error("Failed to load knowledge base", e);
+      console.error("Failed to load knowledge base from storage", e);
     }
   };
 
-  const saveKnowledge = async (docs: DocChunk[]) => {
+  const saveKnowledge = (docs: DocChunk[]) => {
+    if (typeof window === 'undefined') return;
     try {
-      await fetch('/api/knowledge', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ documents: docs })
-      });
+      localStorage.setItem('knowledge_base', JSON.stringify(docs));
       setKnowledgeBase(docs);
     } catch (e) {
-      console.error("Failed to save knowledge base", e);
+      console.error("Failed to save knowledge base to storage", e);
     }
   };
 
@@ -420,7 +419,7 @@ export default function Page() {
                                       </span>
                                       <span className="text-[9px] font-mono opacity-50">SCORE: {ctx.score.toFixed(4)}</span>
                                     </div>
-                                    <p className="text-text-dim italic line-clamp-3">"{ctx.text}"</p>
+                                    <p className="text-text-dim line-clamp-3">"{ctx.text}"</p>
                                   </div>
                                 ))}
                               </div>
@@ -604,7 +603,7 @@ export default function Page() {
                               </div>
                             </div>
                           ) : (
-                            <p className="text-[13px] text-text-dim leading-relaxed italic">
+                            <p className="text-[13px] text-text-dim leading-relaxed">
                               {doc.text}
                             </p>
                           )}
