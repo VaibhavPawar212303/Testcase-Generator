@@ -1,0 +1,6 @@
+{
+  "name": "Knowledge Terminal RAG",
+  "description": "A terminal-inspired RAG pipeline application using Gemini for knowledge retrieval and generation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
