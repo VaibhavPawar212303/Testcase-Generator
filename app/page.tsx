@@ -97,25 +97,28 @@ export default function Page() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const fetchKnowledge = () => {
-    if (typeof window === 'undefined') return;
+  const fetchKnowledge = async () => {
     try {
-      const stored = localStorage.getItem('knowledge_base');
-      if (stored) {
-        setKnowledgeBase(JSON.parse(stored));
+      const res = await fetch('/api/knowledge');
+      const data = await res.json();
+      if (data.documents) {
+        setKnowledgeBase(data.documents);
       }
     } catch (e) {
-      console.error("Failed to load knowledge base from storage", e);
+      console.error("Failed to load knowledge base from TiDB", e);
     }
   };
 
-  const saveKnowledge = (docs: DocChunk[]) => {
-    if (typeof window === 'undefined') return;
+  const saveKnowledge = async (docs: DocChunk[]) => {
     try {
-      localStorage.setItem('knowledge_base', JSON.stringify(docs));
+      await fetch('/api/knowledge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ documents: docs })
+      });
       setKnowledgeBase(docs);
     } catch (e) {
-      console.error("Failed to save knowledge base to storage", e);
+      console.error("Failed to save knowledge base to TiDB", e);
     }
   };
 
@@ -225,21 +228,31 @@ export default function Page() {
   };
 
   const handleDeleteDoc = async (id: string) => {
-    const updated = knowledgeBase.filter(d => d.id !== id);
-    await saveKnowledge(updated);
+    try {
+      await fetch(`/api/knowledge?id=${id}`, { method: 'DELETE' });
+      setKnowledgeBase(prev => prev.filter(d => d.id !== id));
+    } catch (e) {
+      console.error("Failed to delete from TiDB", e);
+    }
   };
 
   const handleUpdateDoc = async (id: string) => {
-    const updated = await Promise.all(knowledgeBase.map(async (doc) => {
-      if (doc.id === id) {
-        const embedding = await getEmbedding(editingDocText);
-        return { ...doc, text: editingDocText, embedding };
-      }
-      return doc;
-    }));
-    
-    await saveKnowledge(updated);
-    setEditingDocId(null);
+    try {
+      const docToUpdate = knowledgeBase.find(d => d.id === id);
+      if (!docToUpdate) return;
+
+      const embedding = await getEmbedding(editingDocText);
+      await fetch('/api/knowledge', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, text: editingDocText, embedding })
+      });
+
+      setKnowledgeBase(prev => prev.map(d => d.id === id ? { ...d, text: editingDocText, embedding } : d));
+      setEditingDocId(null);
+    } catch (e) {
+      console.error("Failed to update in TiDB", e);
+    }
   };
 
   const handleUpdateMessage = (id: string) => {
@@ -663,7 +676,7 @@ export default function Page() {
                   <div className="space-y-4 text-[11px] leading-relaxed uppercase font-bold tracking-widest text-text-active">
                     <div className="flex justify-between">
                       <span className="text-text-dim">Memory Cluster</span>
-                      <span>JSON_LOCAL_STORE</span>
+                      <span>TiDB_CLOUD_SERVERLESS</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-text-dim">Vector Dimensions</span>
