@@ -15,6 +15,9 @@ import {
   Plus, 
   Cpu, 
   ChevronRight,
+  ArrowRight,
+  X,
+  CheckCircle2,
   Loader2,
   FileText,
   Search,
@@ -70,7 +73,6 @@ export default function Page() {
   ]);
   const [input, setInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
-  const [isFetchingUrl, setIsFetchingUrl] = useState(false);
   const [uploadText, setUploadText] = useState('');
   const [uploadSource, setUploadSource] = useState('');
   const [urlInput, setUrlInput] = useState('');
@@ -79,6 +81,15 @@ export default function Page() {
   const [editingDocText, setEditingDocText] = useState('');
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingMessageText, setEditingMessageText] = useState('');
+  
+  // Pipeline States
+  const [pipelineStep, setPipelineStep] = useState<'idle' | 'fetching' | 'review_raw' | 'processing_ai' | 'review_processed' | 'chunking' | 'finished'>('idle');
+  const [rawFetchedText, setRawFetchedText] = useState('');
+  const [processedAiText, setProcessedAiText] = useState('');
+  const [pipelineChunks, setPipelineChunks] = useState<{ id: string; text: string }[]>([]);
+  const [showPipelineModal, setShowPipelineModal] = useState(false);
+  const [pipelineError, setPipelineError] = useState<string | null>(null);
+
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -100,12 +111,27 @@ export default function Page() {
   const fetchKnowledge = async () => {
     try {
       const res = await fetch('/api/knowledge');
+      if (!res.ok) {
+        let errorMessage = `Server error: ${res.status}`;
+        try {
+          const errorData = await res.json();
+          errorMessage = errorData.error || errorMessage;
+        } catch (e) {
+          // Response was not JSON
+        }
+        throw new Error(errorMessage);
+      }
       const data = await res.json();
       if (data.documents) {
         setKnowledgeBase(data.documents);
       }
     } catch (e) {
       console.error("Failed to load knowledge base from TiDB", e);
+      setMessages(prev => [...prev, { 
+        id: Date.now().toString(), 
+        role: 'system', 
+        content: `// DATABASE_OFFLINE: FAILED TO LOAD KNOWLEDGE BASE [${(e as Error).message}]` 
+      }]);
     }
   };
 
@@ -150,36 +176,81 @@ export default function Page() {
 
   const handleIngestUrl = async () => {
     if (!urlInput.trim()) return;
-    setIsFetchingUrl(true);
+    setPipelineStep('fetching');
+    setShowPipelineModal(true);
+    setPipelineError(null);
+    setRawFetchedText('');
+    setProcessedAiText('');
+    setPipelineChunks([]);
+
     try {
       const response = await fetch('/api/fetch-url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: urlInput })
       });
+
+      if (!response.ok) {
+        let errorMessage = `Fetch failed: ${response.status}`;
+        try {
+          const errorData = await response.json();
+          errorMessage = errorData.error || errorMessage;
+        } catch (e) {}
+        throw new Error(errorMessage);
+      }
       const data = await response.json();
       if (data.error) throw new Error(data.error);
 
-      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', content: `// ANALYZING CONTENT FROM: ${urlInput}` }]);
-      
+      setRawFetchedText(data.text);
+      setPipelineStep('review_raw');
+    } catch (err) {
+      console.error("URL Fetch failed", err);
+      setPipelineError((err as Error).message);
+    }
+  };
+
+  const handleAiProcess = async () => {
+    setPipelineStep('processing_ai');
+    setPipelineError(null);
+    try {
       const extraction = await ai.models.generateContent({
         model: 'gemini-3-flash-preview',
-        contents: `Extract the most important technical or factual information from this raw text and format it as 3-5 distinct paragraphs. Each paragraph should be a self-contained "fact" or "knowledge piece".\n\nRAW TEXT:\n${data.text}`,
+        contents: `Extract the most important technical or factual information from this raw text and format it as a consolidated, clean knowledge base text. Focus on facts and useful details.\n\nRAW TEXT:\n${rawFetchedText}`,
         config: {
-          systemInstruction: "You are a data extraction specialist. Convert messy website text into clean, factual paragraphs for a knowledge base."
+          systemInstruction: "You are a data extraction specialist. Convert messy website text into a clean, factual knowledge summary."
         }
       });
       
-      const textResponse = extraction.text;
+      setProcessedAiText(extraction.text);
+      setPipelineStep('review_processed');
+    } catch (err) {
+      console.error("AI Processing failed", err);
+      setPipelineError((err as Error).message);
+    }
+  };
 
-      const chunks = textResponse.split('\n\n').filter(p => p.trim());
+  const handleGenerateChunks = () => {
+    setPipelineStep('chunking');
+    // Simulate a small delay for "chunking" effect
+    setTimeout(() => {
+      const chunks = processedAiText.split('\n\n').filter(p => p.trim()).map(text => ({
+        id: crypto.randomUUID(),
+        text: text
+      }));
+      setPipelineChunks(chunks);
+      setPipelineStep('finished');
+    }, 1000);
+  };
+
+  const handleSavePipelineChunks = async () => {
+    setIsProcessing(true);
+    try {
       const newDocs: DocChunk[] = [];
-      
-      for (const chunkText of chunks) {
-        const embedding = await getEmbedding(chunkText);
+      for (const chunk of pipelineChunks) {
+        const embedding = await getEmbedding(chunk.text);
         newDocs.push({
-          id: crypto.randomUUID(),
-          text: chunkText,
+          id: chunk.id,
+          text: chunk.text,
           embedding,
           metadata: {
             source: urlInput,
@@ -190,13 +261,15 @@ export default function Page() {
 
       const updatedKB = [...knowledgeBase, ...newDocs];
       await saveKnowledge(updatedKB);
+      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', content: `// PIPELINE_COMPLETED: ADDED ${newDocs.length} CHUNKS FROM ${urlInput}` }]);
+      setShowPipelineModal(false);
       setUrlInput('');
-      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', content: `// SUCCESSFULLY INGESTED ${newDocs.length} CHUNKS FROM WEB.` }]);
+      setPipelineStep('idle');
     } catch (err) {
-      console.error("URL Ingestion failed", err);
-      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', content: `// ERROR: INGESTION FAILED [${(err as Error).message}]` }]);
+      console.error("Saving chunks failed", err);
+      setPipelineError((err as Error).message);
     } finally {
-      setIsFetchingUrl(false);
+      setIsProcessing(false);
     }
   };
 
@@ -506,11 +579,11 @@ export default function Page() {
                       />
                       <button 
                         onClick={handleIngestUrl}
-                        disabled={isFetchingUrl || !urlInput}
+                        disabled={pipelineStep === 'fetching' || !urlInput}
                         className="px-6 bg-text-active text-bg-primary hover:bg-bg-primary hover:text-text-active border-2 border-border-main transition-all text-xs font-black uppercase tracking-widest disabled:opacity-20 flex items-center gap-2"
                       >
-                        {isFetchingUrl ? <Loader2 className="animate-spin" size={16} /> : <Upload size={16} />}
-                        Fetch & Vectorize
+                        {pipelineStep === 'fetching' ? <Loader2 className="animate-spin" size={16} /> : <Activity size={16} />}
+                        Start Pipeline
                       </button>
                     </div>
                   </div>
@@ -719,6 +792,186 @@ export default function Page() {
           NODE_ID: REMOTE_SYSTEM_01
         </div>
       </footer>
+
+      {/* Pipeline Modal Overlay */}
+      <AnimatePresence>
+        {showPipelineModal && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-bg-primary/95 backdrop-blur-sm"
+          >
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="w-full max-w-2xl bg-bg-secondary border-2 border-border-main p-6 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+            >
+              {/* Modal Header */}
+              <div className="flex items-center justify-between border-b-2 border-border-main pb-4 mb-6">
+                <div className="flex items-center gap-3">
+                  <Activity size={18} className="text-accent" />
+                  <h3 className="text-sm font-black uppercase tracking-[0.3em] text-text-active">Knowledge Pipeline</h3>
+                </div>
+                <button 
+                  onClick={() => setShowPipelineModal(false)}
+                  className="p-1 hover:text-accent transition-colors"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+
+              {/* Progress Steps */}
+              <div className="flex items-center justify-between mb-8 px-4">
+                {[
+                  { step: 'fetching', label: 'FETCH' },
+                  { step: 'review_raw', label: 'REVIEW' },
+                  { step: 'processing_ai', label: 'AI_MODEL' },
+                  { step: 'review_processed', label: 'KNOWLEDGE' },
+                  { step: 'chunking', label: 'CHUNKS' }
+                ].map((s, idx, arr) => {
+                  const isActive = pipelineStep === s.step || 
+                    (s.step === 'fetching' && pipelineStep !== 'idle') ||
+                    (s.step === 'review_raw' && !['idle', 'fetching'].includes(pipelineStep)) ||
+                    (s.step === 'processing_ai' && !['idle', 'fetching', 'review_raw'].includes(pipelineStep)) ||
+                    (s.step === 'review_processed' && !['idle', 'fetching', 'review_raw', 'processing_ai'].includes(pipelineStep)) ||
+                    (s.step === 'chunking' && pipelineStep === 'finished');
+                  
+                  return (
+                    <React.Fragment key={s.step}>
+                      <div className="flex flex-col items-center gap-2">
+                        <div className={cn(
+                          "w-8 h-8 rounded-full border-2 flex items-center justify-center text-[10px] font-black transition-all",
+                          isActive ? "bg-accent border-accent text-bg-primary" : "border-border-main text-text-dim"
+                        )}>
+                          {idx + 1}
+                        </div>
+                        <span className={cn("text-[8px] font-black tracking-widest uppercase", isActive ? "text-accent" : "text-text-dim")}>
+                          {s.label}
+                        </span>
+                      </div>
+                      {idx < arr.length - 1 && (
+                        <div className={cn("flex-1 h-[2px] mb-4", isActive ? "bg-accent" : "bg-border-main")} />
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+              </div>
+
+              {/* Modal Content */}
+              <div className="flex-1 overflow-y-auto mb-6 pr-2">
+                {pipelineError ? (
+                  <div className="p-4 border-2 border-red-500 bg-red-500/10 text-red-500 text-xs font-bold uppercase tracking-widest">
+                    // ERROR: {pipelineError}
+                    <button 
+                      onClick={handleIngestUrl}
+                      className="block mt-4 text-bg-primary bg-red-500 px-4 py-2 hover:bg-bg-primary hover:text-red-500 border-2 border-red-500 transition-all font-black"
+                    >
+                      Retry Pipeline
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    {pipelineStep === 'fetching' && (
+                      <div className="flex flex-col items-center justify-center py-20 gap-4">
+                        <Loader2 className="animate-spin text-accent" size={32} />
+                        <span className="text-xs font-black uppercase tracking-[0.3em] text-text-active">Retrieving Remote Content...</span>
+                      </div>
+                    )}
+
+                    {pipelineStep === 'review_raw' && (
+                      <div className="space-y-4">
+                        <div className="flex items-center justify-between">
+                          <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Raw Fetched Details</h4>
+                          <span className="text-[9px] font-mono opacity-50">{rawFetchedText.length} characters</span>
+                        </div>
+                        <div className="bg-bg-primary p-4 border-2 border-border-main/10 text-xs leading-relaxed text-text-dim font-mono h-64 overflow-y-auto">
+                          {rawFetchedText}
+                        </div>
+                      </div>
+                    )}
+
+                    {pipelineStep === 'processing_ai' && (
+                      <div className="flex flex-col items-center justify-center py-20 gap-4">
+                        <Loader2 className="animate-spin text-accent" size={32} />
+                        <span className="text-xs font-black uppercase tracking-[0.3em] text-text-active">Gemini_Core processing knowledge...</span>
+                      </div>
+                    )}
+
+                    {pipelineStep === 'review_processed' && (
+                      <div className="space-y-4">
+                        <div className="flex items-center justify-between">
+                          <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Synthesized Knowledge Base</h4>
+                          <span className="text-[9px] font-mono opacity-50">OPTIMIZED_STRUCTURE</span>
+                        </div>
+                        <div className="bg-bg-primary p-4 border-2 border-border-main/10 text-xs leading-relaxed text-text-active h-64 overflow-y-auto markdown-body">
+                          <ReactMarkdown>{processedAiText}</ReactMarkdown>
+                        </div>
+                      </div>
+                    )}
+
+                    {pipelineStep === 'chunking' && (
+                      <div className="flex flex-col items-center justify-center py-20 gap-4">
+                        <Loader2 className="animate-spin text-accent" size={32} />
+                        <span className="text-xs font-black uppercase tracking-[0.3em] text-text-active">Fragmenting knowledge vectors...</span>
+                      </div>
+                    )}
+
+                    {pipelineStep === 'finished' && (
+                      <div className="space-y-4">
+                        <div className="flex items-center justify-between">
+                          <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Generated Document Chunks</h4>
+                          <span className="text-[9px] font-black bg-accent text-bg-primary px-2 py-0.5">{pipelineChunks.length} FRAGMENTS</span>
+                        </div>
+                        <div className="space-y-2">
+                          {pipelineChunks.map((chunk, i) => (
+                            <div key={chunk.id} className="p-3 border-2 border-border-main/10 bg-bg-primary text-[11px] leading-relaxed text-text-dim">
+                              <span className="font-black text-accent mr-2">CH_{i+1}:</span> {chunk.text}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+
+              {/* Modal Footer Controls */}
+              {!pipelineError && (
+                <div className="flex justify-end pt-6 border-t-2 border-border-main gap-4">
+                  {pipelineStep === 'review_raw' && (
+                    <button 
+                      onClick={handleAiProcess}
+                      className="px-8 py-3 bg-text-active text-bg-primary hover:bg-bg-primary hover:text-text-active border-2 border-text-active transition-all text-xs font-black uppercase tracking-widest flex items-center gap-2"
+                    >
+                      Process with AI <ArrowRight size={14} />
+                    </button>
+                  )}
+                  {pipelineStep === 'review_processed' && (
+                    <button 
+                      onClick={handleGenerateChunks}
+                      className="px-8 py-3 bg-text-active text-bg-primary hover:bg-bg-primary hover:text-text-active border-2 border-text-active transition-all text-xs font-black uppercase tracking-widest flex items-center gap-2"
+                    >
+                      Generate Chunks <ArrowRight size={14} />
+                    </button>
+                  )}
+                  {pipelineStep === 'finished' && (
+                    <button 
+                      onClick={handleSavePipelineChunks}
+                      disabled={isProcessing}
+                      className="px-8 py-3 bg-accent text-bg-primary hover:bg-bg-white hover:text-bg-primary border-2 border-accent transition-all text-xs font-black uppercase tracking-widest flex items-center gap-2"
+                    >
+                      {isProcessing ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
+                      Commit to TiDB
+                    </button>
+                  )}
+                </div>
+              )}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
