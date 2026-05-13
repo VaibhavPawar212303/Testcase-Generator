@@ -24,7 +24,9 @@ import {
   Activity,
   User,
   Sun,
-  Moon
+  Moon,
+  Settings,
+  Info
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { GoogleGenAI } from "@google/genai";
@@ -66,10 +68,10 @@ const ai = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY || '
 // Given the environment constraints, process.env.GEMINI_API_KEY is available.
 
 export default function Page() {
-  const [activeTab, setActiveTab] = useState<'chat' | 'stats' | 'profile'>('chat');
+  const [activeTab, setActiveTab] = useState<'chat' | 'stats' | 'profile' | 'settings'>('chat');
   const [knowledgeBase, setKnowledgeBase] = useState<DocChunk[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([
-    { id: '1', role: 'system', content: '// KNOWLEDGE TERMINAL v1.0.4 READY TO PROCESS.' }
+    { id: '1', role: 'system', content: '// KNOWLEDGE TERMINAL v1.1.0 READY. SELECT PROCESSING NODE.' }
   ]);
   const [input, setInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
@@ -81,6 +83,11 @@ export default function Page() {
   const [editingDocText, setEditingDocText] = useState('');
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingMessageText, setEditingMessageText] = useState('');
+  
+  // Model Settings
+  const [selectedModel, setSelectedModel] = useState('gemini-1.5-flash');
+  const [availableModels, setAvailableModels] = useState<any[]>([]);
+  const [isFetchingModels, setIsFetchingModels] = useState(false);
   
   // Pipeline States
   const [pipelineStep, setPipelineStep] = useState<'idle' | 'fetching' | 'review_raw' | 'processing_ai' | 'review_processed' | 'chunking' | 'finished'>('idle');
@@ -134,6 +141,27 @@ export default function Page() {
       }]);
     }
   };
+
+  const fetchModels = async () => {
+    setIsFetchingModels(true);
+    try {
+      const res = await fetch('/api/models');
+      const data = await res.json();
+      if (data.models) {
+        setAvailableModels(data.models);
+      }
+    } catch (e) {
+      console.error("Failed to fetch models", e);
+    } finally {
+      setIsFetchingModels(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'settings' && availableModels.length === 0) {
+      fetchModels();
+    }
+  }, [activeTab]);
 
   const saveKnowledge = async (docs: DocChunk[]) => {
     try {
@@ -214,7 +242,7 @@ export default function Page() {
     setPipelineError(null);
     try {
       const extraction = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
+        model: selectedModel,
         contents: `Extract the most important technical or factual information from this raw text and format it as a consolidated, clean knowledge base text. Focus on facts and useful details.\n\nRAW TEXT:\n${rawFetchedText}`,
         config: {
           systemInstruction: "You are a data extraction specialist. Convert messy website text into a clean, factual knowledge summary."
@@ -358,7 +386,7 @@ export default function Page() {
         : "No relevant documents found in knowledge base.";
 
       const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
+        model: selectedModel,
         contents: `You are a RAG Knowledge Terminal. Answer the user prompt based strictly on the provided knowledge base context. If the answer is not in the context, say you don't know based on human data.\n\nCONTEXT:\n${context}\n\nUSER PROMPT:\n${userMsg.content}`,
         config: {
           systemInstruction: "You are a professional retrieval system. Provide citations like [Source: X]. Use clear, structured monochrome-friendly formatting."
@@ -389,7 +417,7 @@ export default function Page() {
       {/* Header Tabs */}
       <div className="flex items-center justify-between border-b border-border-main mb-8 overflow-hidden">
         <div className="flex gap-8 overflow-x-auto">
-          {(['chat', 'stats', 'profile'] as const).map((tab) => (
+          {(['chat', 'stats', 'profile', 'settings'] as const).map((tab) => (
             <button
               key={tab}
               id={`tab-${tab}`}
@@ -716,6 +744,143 @@ export default function Page() {
                       </div>
                     ))
                   )}
+                </div>
+              </div>
+            </motion.div>
+          )}
+
+          {activeTab === 'settings' && (
+            <motion.div 
+              key="settings"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="h-full flex flex-col gap-10 overflow-y-auto pr-4 pb-12"
+            >
+              <div className="space-y-4">
+                <div className="flex items-center justify-between border-b border-border-main pb-4">
+                  <div className="flex items-center gap-3 text-text-active">
+                    <Settings size={18} strokeWidth={2.5} />
+                    <h2 className="text-sm font-black uppercase tracking-[0.3em]">Processing Control Center</h2>
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <button 
+                      onClick={fetchModels}
+                      disabled={isFetchingModels}
+                      className="text-[10px] font-black underline uppercase tracking-widest text-accent hover:text-text-active disabled:opacity-30"
+                    >
+                      {isFetchingModels ? "DISCOVERING_NODES..." : "RESYNC_ACTIVE_NODES"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  {/* Active Processing Node Selection */}
+                  <div className="space-y-4">
+                    <h3 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Active Intelligence Node</h3>
+                    <div className="space-y-2">
+                      {isFetchingModels ? (
+                        Array.from({ length: 3 }).map((_, i) => (
+                          <div key={i} className="h-16 border-2 border-border-main/10 bg-bg-secondary animate-pulse" />
+                        ))
+                      ) : (
+                        availableModels.map((model) => (
+                          <button
+                            key={model.name}
+                            onClick={() => setSelectedModel(model.name)}
+                            className={cn(
+                              "w-full p-4 border-2 transition-all text-left flex items-center justify-between group",
+                              selectedModel === model.name 
+                                ? "bg-bg-secondary border-accent" 
+                                : "bg-bg-primary border-border-main/5 hover:border-border-main"
+                            )}
+                          >
+                            <div className="flex flex-col gap-1">
+                              <span className={cn(
+                                "text-[12px] font-black tracking-widest uppercase",
+                                selectedModel === model.name ? "text-accent" : "text-text-active"
+                              )}>
+                                {model.name}
+                              </span>
+                              <span className="text-[9px] text-text-dim font-mono line-clamp-1 opacity-60">
+                                {model.displayName}
+                              </span>
+                            </div>
+                            <div className={cn(
+                              "w-4 h-4 rounded-full border-2 flex items-center justify-center transition-all",
+                              selectedModel === model.name ? "bg-accent border-accent" : "border-border-main"
+                            )}>
+                              {selectedModel === model.name && <div className="w-1.5 h-1.5 bg-bg-primary rounded-full transition-transform" />}
+                            </div>
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Node Diagnostics */}
+                  <div className="space-y-4">
+                    <h3 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Intelligence Node Diagnostics</h3>
+                    <div className="bg-bg-secondary border-2 border-border-main p-6 space-y-6">
+                      <div className="space-y-4">
+                        <div className="flex items-center gap-2 text-accent">
+                          <Activity size={14} />
+                          <span className="text-[10px] font-black uppercase tracking-widest underline">NODE_STATUS: STABLE</span>
+                        </div>
+                        
+                        {availableModels.find(m => m.name === selectedModel) && (
+                          <div className="space-y-4">
+                            <div className="space-y-1">
+                              <label className="text-[9px] font-bold text-text-dim uppercase tracking-tighter">Selected Processing Node</label>
+                              <div className="text-xs font-black text-text-active uppercase">{selectedModel}</div>
+                            </div>
+                            <div className="space-y-1">
+                              <label className="text-[9px] font-bold text-text-dim uppercase tracking-tighter">Node Capabilities</label>
+                              <div className="grid grid-cols-2 gap-2 mt-2">
+                                <div className="p-2 border border-border-main/10 bg-bg-primary">
+                                  <div className="text-[8px] font-bold text-text-dim uppercase mb-1">Input Limit</div>
+                                  <div className="text-[10px] font-black text-accent">{availableModels.find(m => m.name === selectedModel)?.inputTokenLimit.toLocaleString()} TKNS</div>
+                                </div>
+                                <div className="p-2 border border-border-main/10 bg-bg-primary">
+                                  <div className="text-[8px] font-bold text-text-dim uppercase mb-1">Output Limit</div>
+                                  <div className="text-[10px] font-black text-accent">{availableModels.find(m => m.name === selectedModel)?.outputTokenLimit.toLocaleString()} TKNS</div>
+                                </div>
+                              </div>
+                            </div>
+                            <div className="p-3 bg-bg-primary border border-border-main/10 text-[10px] italic leading-relaxed text-text-dim font-mono">
+                              {availableModels.find(m => m.name === selectedModel)?.description}
+                            </div>
+                          </div>
+                        )}
+                        
+                        {!availableModels.length && !isFetchingModels && (
+                          <div className="py-10 text-center space-y-4">
+                            <Info size={24} className="mx-auto text-text-dim opacity-20" />
+                            <p className="text-[10px] font-bold text-text-dim uppercase tracking-widest leading-relaxed">
+                              No processing nodes detected.<br/>Synchronize with Gemini Network.
+                            </p>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="pt-6 border-t border-border-main">
+                        <div className="flex items-center gap-2 text-text-active mb-4">
+                          <CheckCircle2 size={12} />
+                          <span className="text-[10px] font-black uppercase tracking-widest">Environment Variables</span>
+                        </div>
+                        <div className="grid grid-cols-1 gap-2">
+                          <div className="flex items-center justify-between p-2 border border-border-main text-[10px] font-mono">
+                            <span className="text-text-dim">GEMINI_API_KEY</span>
+                            <span className="text-accent">ENCRYPTED</span>
+                          </div>
+                          <div className="flex items-center justify-between p-2 border border-border-main text-[10px] font-mono">
+                            <span className="text-text-dim">DB_PROVIDER</span>
+                            <span className="text-accent">TiDB_SERVERLESS</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
             </motion.div>
