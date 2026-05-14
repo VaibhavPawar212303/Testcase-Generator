@@ -237,42 +237,8 @@ export default function Page() {
     return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
   };
 
-  const fetchWithRetry = async (url: string, retries = 1): Promise<any> => {
-    for (let i = 0; i <= retries; i++) {
-      try {
-        const response = await fetch('/api/fetch-url', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url })
-        });
-        if (!response.ok) throw new Error(`HTTP_${response.status}`);
-        const data = await response.json();
-        
-        // If text is suspiciously short, it might be a loading screen or failed render
-        if ((!data.text || data.text.length < 200) && i < retries) {
-          addLog(`PARTIAL_CONTENT_DETECTED: ${url}. ATTEMPTING_RECOVERY_${i+1}/${retries}...`);
-          await new Promise(r => setTimeout(r, 2000)); // Wait before retry
-          continue;
-        }
-        return data;
-      } catch (err) {
-        if (i === retries) throw err;
-        addLog(`NETWORK_FLAKE_DETECTED: ${url}. RETRYING...`);
-        await new Promise(r => setTimeout(r, 1000));
-      }
-    }
-  };
-
   const handleIngestUrl = async () => {
-    let targetUrl = urlInput.trim();
-    if (!targetUrl) return;
-    
-    // Ensure protocol
-    if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-      targetUrl = `https://${targetUrl}`;
-      setUrlInput(targetUrl);
-    }
-
+    if (!urlInput.trim()) return;
     setPipelineStep('fetching');
     setShowPipelineModal(true);
     setPipelineError(null);
@@ -285,12 +251,20 @@ export default function Page() {
     setIsCrawlingFinished(false);
 
     try {
-      addLog(`INITIATING_CORE_PIPELINE: TARGET=${targetUrl}`);
+      addLog(`INITIATING_CORE_PIPELINE: TARGET=${urlInput}`);
       addLog("LAUNCHING_PLAYWRIGHT_INSTANCE...");
       // 1. Initial Fetch
-      const data = await fetchWithRetry(targetUrl);
+      const response = await fetch('/api/fetch-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: urlInput })
+      });
 
-      addLog(`SUCCESSFULLY_NAVIGATED: ${targetUrl}`);
+      if (!response.ok) throw new Error(`Fetch failed: ${response.status}`);
+      const data = await response.json();
+      if (data.error) throw new Error(data.error);
+
+      addLog(`SUCCESSFULLY_NAVIGATED: ${urlInput}`);
       addLog(`TITLE: ${data.title}`);
       addLog(`DISCOVERED_LINKS: ${data.links?.length || 0}`);
       addLog(`CRAWL_READY: SELECT_TARGET_NODES`);
@@ -326,51 +300,33 @@ export default function Page() {
   };
 
   const startMultiCrawl = async (initialQueue: string[], rootUrl: string) => {
-    // Deduplicate targets by normalized URL to avoid redundant fetches
-    const deduplicatedQueue = Array.from(new Set(initialQueue.map(u => u.split('#')[0].replace(/\/$/, ''))));
-    const maxPages = 100; // Allow more nodes if discovered later
+    const maxPages = 15; // Increased breadth for deeper knowledge
+    const queue = initialQueue.slice(0, maxPages - 1);
     const visited = new Set([rootUrl]);
-    const normalizedVisited = new Set([rootUrl.split('#')[0].replace(/\/$/, '')]);
     const newDataMap = new Map(crawledData);
     
-    addLog(`STARTING_CRAWL: TARGETING_${deduplicatedQueue.length}_UNIQUE_NODES`);
+    addLog(`STARTING_BREADTH_FIRST_CRAWL: LIMIT=${maxPages}_NODES`);
     
-    let errorCount = 0;
-    const maxErrors = 5;
-
-    for (const url of deduplicatedQueue) {
-      if (!url) continue;
-      const normalizedUrl = url.split('#')[0].replace(/\/$/, '');
-      
-      if (normalizedVisited.has(normalizedUrl)) {
-         continue;
-      }
-      
-      if (visited.size >= maxPages) {
-        addLog(`REACHED_VIRTUAL_LIMIT_OF_${maxPages}_NODES. HALTING.`);
-        break;
-      }
-
-      if (errorCount >= maxErrors) {
-        addLog(`CONSECUTIVE_ERRORS_THRESHOLD_REACHED. HALTING CRAWL TO PRESERVE RESOURCES.`);
-        break;
-      }
+    for (const url of queue) {
+      if (visited.has(url)) continue;
+      if (visited.size >= maxPages) break;
       
       setCurrentCrawlingUrl(url);
-      addLog(`FETCH_REQUEST: ${url}`);
-      
-      // Increased throttle: slower crawl is more reliable in serverless and less likely to trigger rate limits
-      await new Promise(r => setTimeout(r, 2000));
-
+      addLog(`PLAYWRIGHT_DISPATCH: TARGET=${url}`);
       try {
-        const data = await fetchWithRetry(url);
+        const response = await fetch('/api/fetch-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url })
+        });
         
-        if (data.error) throw new Error(data.error);
-
-        errorCount = 0; // Reset errors on success
+        if (!response.ok) {
+           addLog(`FETCH_FAILED_FOR_NODE: ${url} (CODE: ${response.status})`);
+           continue;
+        }
+        const data = await response.json();
         
         visited.add(url);
-        normalizedVisited.add(normalizedUrl);
         newDataMap.set(url, {
           url,
           title: data.title || url,
@@ -381,21 +337,18 @@ export default function Page() {
           screenshot: data.screenshot
         });
         
-        addLog(`INGESTED: ${data.title} (${data.fallback ? 'HTML_ONLY' : 'PLAYWRIGHT'})`);
+        addLog(`NODE_INGESTED: ${data.title} || ${data.links?.length || 0}_LINKS`);
         
         // Progressively update state for UI feedback
         setCrawledData(new Map(newDataMap));
         setVisitedUrls(new Set(visited));
       } catch (err) {
-        errorCount++;
-        addLog(`FAILED_NODE: ${url} - ${(err as Error).message}`);
-        // Even on error, we mark as visited to avoid looping/retrying this specific URL
-        normalizedVisited.add(normalizedUrl);
+        addLog(`STREAMS_ERROR_AT_NODE: ${url}`);
         console.error(`Crawl failed for ${url}`, err);
       }
     }
     
-    addLog(`CRAWL_FINISHED: ${newDataMap.size}_SUCCESSFUL_NODES_IN_GRAPH`);
+    addLog(`CRAWL_FINISHED: ${visited.size}_NODES_IN_GRAPH`);
     setCurrentCrawlingUrl(null);
     setIsCrawlingFinished(true);
     setPipelineStep('review_crawl');
