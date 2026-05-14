@@ -13,33 +13,32 @@ export async function POST(req: Request) {
     console.log(`Starting scrap for URL: ${url}`);
     
     // Detect environment and launch browser
-    const { chromium } = await import('playwright-core');
+    const { chromium } = await import('playwright');
     
     try {
-      console.log("Attempting standard chromium launch...");
-      // For local/full environments where playwright is installed
+      console.log("Attempting standard chromium launch via playwright package...");
       browser = await chromium.launch({
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
       });
     } catch (launchError) {
-      console.warn("Standard launch failed, attempting sparticuz fallback...", launchError);
+      console.warn("Standard launch failed, trying with playwright-core + sparticuz:", launchError);
       try {
+        const { chromium: chromiumCore } = await import('playwright-core');
         const sparticuzModule = await import('@sparticuz/chromium');
         const sparticuz = (sparticuzModule as any).default || sparticuzModule;
         const executablePath = await sparticuz.executablePath();
         
-        browser = await chromium.launch({
+        browser = await chromiumCore.launch({
           executablePath,
           args: sparticuz.args,
           headless: sparticuz.headless,
-          // Extra args that help in serverless
           handleSIGINT: false,
           handleSIGTERM: false,
           handleSIGHUP: false
         });
       } catch (sparticuzError) {
         console.error("All launch methods failed:", sparticuzError);
-        throw new Error(`Failed to launch browser. Environment might missing dependencies. Original error: ${(launchError as Error).message}. Sparticuz error: ${(sparticuzError as Error).message}`);
+        throw new Error(`CRITICAL: Browser launch failed. Environment missing dependencies or Chromium binary. Details: ${(launchError as Error).message}`);
       }
     }
     
@@ -99,13 +98,18 @@ export async function POST(req: Request) {
     }
     
     // Take screenshot (reduced quality to save memory)
-    const screenshot = await page.screenshot({ type: 'jpeg', quality: 40 });
+    const screenshot = await page.screenshot({ type: 'jpeg', quality: 30 });
     const screenshotBase64 = screenshot.toString('base64');
     
     // Extract content and links
     const data = await page.evaluate(() => {
       if (!document.body) return { text: '', title: '', links: [] };
       
+      const getMeaningfulText = (el: HTMLElement) => {
+        const text = el.innerText.replace(/\s+/g, ' ').trim();
+        return text;
+      };
+
       // 1. Extract internal links BEFORE cleanup
       const currentUrl = window.location.href;
       const baseUrl = window.location.origin;

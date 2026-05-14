@@ -326,21 +326,22 @@ export default function Page() {
   };
 
   const startMultiCrawl = async (initialQueue: string[], rootUrl: string) => {
-    const maxPages = Math.max(50, initialQueue.length + 1); 
-    const queue = initialQueue.slice(0, maxPages - 1);
+    // Deduplicate targets by normalized URL to avoid redundant fetches
+    const deduplicatedQueue = Array.from(new Set(initialQueue.map(u => u.split('#')[0].replace(/\/$/, ''))));
+    const maxPages = 100; // Allow more nodes if discovered later
     const visited = new Set([rootUrl]);
     const normalizedVisited = new Set([rootUrl.split('#')[0].replace(/\/$/, '')]);
     const newDataMap = new Map(crawledData);
     
-    addLog(`STARTING_BREADTH_FIRST_CRAWL: TARGETING_${queue.length}_NODES`);
+    addLog(`STARTING_CRAWL: TARGETING_${deduplicatedQueue.length}_UNIQUE_NODES`);
     
-    for (const url of queue) {
+    for (const url of deduplicatedQueue) {
       if (!url) continue;
       const normalizedUrl = url.split('#')[0].replace(/\/$/, '');
       
-      if (normalizedVisited.has(normalizedUrl)) {
-        addLog(`SKIPPING_DUPLICATE_OR_ROOT: ${url}`);
-        continue;
+      if (normalizedVisited.has(normalizedUrl) && url !== rootUrl) {
+         // Already processed this page (or a variant of it)
+         continue;
       }
       
       if (visited.size >= maxPages) {
@@ -350,11 +351,15 @@ export default function Page() {
       
       setCurrentCrawlingUrl(url);
       addLog(`PLAYWRIGHT_DISPATCH: TARGET=${url}`);
+      
+      // Add a small throttle to be respectful and avoid resource contention
+      await new Promise(r => setTimeout(r, 800));
+
       try {
         const data = await fetchWithRetry(url);
         
         visited.add(url);
-        normalizedVisited.add(url.split('#')[0].replace(/\/$/, ''));
+        normalizedVisited.add(normalizedUrl);
         newDataMap.set(url, {
           url,
           title: data.title || url,
@@ -366,18 +371,19 @@ export default function Page() {
         });
         
         addLog(`NODE_INGESTED: ${data.title} || ${data.links?.length || 0}_LINKS`);
-        if (data.text.length < 300) addLog(`WARNING: LOW_CONTENT_DENSITY_AT_${url}`);
         
         // Progressively update state for UI feedback
         setCrawledData(new Map(newDataMap));
         setVisitedUrls(new Set(visited));
       } catch (err) {
         addLog(`STREAMS_ERROR_AT_NODE: ${url} - ${(err as Error).message}`);
+        // Even on error, we mark as visited to avoid looping/retrying this specific URL
+        normalizedVisited.add(normalizedUrl);
         console.error(`Crawl failed for ${url}`, err);
       }
     }
     
-    addLog(`CRAWL_FINISHED: ${visited.size}_NODES_IN_GRAPH`);
+    addLog(`CRAWL_FINISHED: ${newDataMap.size}_SUCCESSFUL_NODES_IN_GRAPH`);
     setCurrentCrawlingUrl(null);
     setIsCrawlingFinished(true);
     setPipelineStep('review_crawl');
