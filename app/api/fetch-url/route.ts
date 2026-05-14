@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 
-// Next.js valid export for Vercel Pro/Enterprise. 
-// NOTE: Memory must be set in the Vercel Dashboard (Option 1)
+// REQUIRED: You must set these in Vercel Dashboard for this route
 export const maxDuration = 30; 
 
 export async function POST(req: Request) {
@@ -10,80 +9,52 @@ export async function POST(req: Request) {
   try {
     const { url } = await req.json();
     
-    // Serverless-friendly browser launch
     const { chromium } = await import('playwright-core');
     const sparticuzModule = await import('@sparticuz/chromium');
     const sparticuz = (sparticuzModule as any).default || sparticuzModule;
     
-    let executablePath;
-    try {
-      executablePath = await sparticuz.executablePath();
-    } catch (e) {
-      console.error("Failed to get sparticuz executable path:", e);
-    }
+    const executablePath = await sparticuz.executablePath();
 
-    const browserOptions: any = {
-      executablePath: executablePath || undefined,
+    browser = await chromium.launch({
+      executablePath,
       headless: true,
       args: [
-        ...(sparticuz.args || []),
+        ...sparticuz.args,
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--no-zygote',
-        '--single-process', // Standard for serverless to save RAM
-        '--disable-extensions',
       ],
-    };
-
-    browser = await chromium.launch(browserOptions);
+    });
     
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      viewport: { width: 1280, height: 800 },
+      viewport: { width: 1080, height: 720 }, // Smaller viewport = less RAM
     });
     
     const page = await context.newPage();
     
+    // FIX: Aggressive Blocking. 
+    // Crashing is usually due to heavy images/fonts filling up the 1GB RAM limit.
     await page.route('**/*', (route) => {
-      const requestUrl = route.request().url();
-      const resourceType = route.request().resourceType();
-      
-      const isTracker = requestUrl.includes('google-analytics') || 
-                        requestUrl.includes('doubleclick') || 
-                        requestUrl.includes('facebook.net') || 
-                        requestUrl.includes('segment.com');
-      
-      // Block media and fonts to save memory (Target Closed is often an OOM error)
-      const blockTypes = ['media', 'font']; 
-      
-      if (isTracker || blockTypes.includes(resourceType)) {
-        route.abort();
-      } else {
-        route.continue();
+      const type = route.request().resourceType();
+      if (['image', 'font', 'media', 'manifest', 'other'].includes(type)) {
+        return route.abort();
       }
+      return route.continue();
     });
     
-    // Step 1: Navigate
+    // Step 1: Navigate with strict timeout
     try {
-      // Shorter timeout to leave time for processing
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 12000 });
+      // If on Vercel Hobby, total time is 10s. We must stop navigation at 7s.
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 7000 });
     } catch (e) {
-      console.warn("Navigation timed out, attempting to proceed with data extraction...");
+      console.warn("Navigation timeout, trying to extract what we have.");
     }
     
-    // Wait briefly for hydration
-    try {
-      await page.waitForLoadState('load', { timeout: 2000 });
-    } catch (e) {}
-    
-    // Simplified scroll
-    await page.evaluate(() => {
-      window.scrollTo(0, 500);
-    }).catch(() => {});
-
-    // Step 2: Extract content and links (FIRST - while memory is stable)
+    // Step 2: Extract content and links
+    // We do this immediately. If evaluate crashes here, the page was too heavy for serverless.
     const data = await page.evaluate(() => {
       const currentUrl = window.location.href;
       const domainParts = window.location.hostname.split('.');
@@ -92,32 +63,34 @@ export async function POST(req: Request) {
       const links = Array.from(document.querySelectorAll('a'))
         .map(a => {
            try {
-             const url = new URL(a.href, currentUrl);
+             const urlObj = new URL(a.href, currentUrl);
              return {
-               href: url.href,
-               text: a.innerText.trim().slice(0, 100) || url.pathname
+               href: urlObj.href,
+               text: a.innerText.trim().slice(0, 80) || urlObj.pathname
              };
            } catch(e) { return null; }
         })
         .filter((link): link is { href: string; text: string } => {
           if (!link || !link.href) return false;
           try {
-            const url = new URL(link.href);
-            const isSameRootDomain = url.hostname.endsWith(rootDomain);
-            const isDifferentPage = url.href.split('#')[0] !== currentUrl.split('#')[0];
+            const u = new URL(link.href);
+            const isSameRootDomain = u.hostname.endsWith(rootDomain);
+            const isDifferentPage = u.href.split('#')[0] !== currentUrl.split('#')[0];
             const isNotStaticAsset = !link.href.match(/\.(png|jpg|jpeg|gif|pdf|zip|gz|svg|css|js|woff|ttf)$/i);
-            const isNotMailOrTel = !link.href.startsWith('mailto:') && !link.href.startsWith('tel:');
-            return isSameRootDomain && isDifferentPage && isNotStaticAsset && isNotMailOrTel;
+            return isSameRootDomain && isDifferentPage && isNotStaticAsset;
           } catch(e) { return false; }
         });
 
       const title = document.title;
-      const noisySelectors = ['script', 'style', 'noscript', 'header', 'footer', 'nav', 'aside', 'iframe', 'button:not([href])'];
+      
+      // Cleanup DOM to free up memory before getting innerText
+      const noisySelectors = ['script', 'style', 'noscript', 'header', 'footer', 'nav', 'aside', 'iframe'];
       noisySelectors.forEach(selector => {
         document.querySelectorAll(selector).forEach(el => el.remove());
       });
       
-      const text = document.body.innerText.replace(/\s+/g, ' ').trim();
+      const text = document.body.innerText.replace(/\s+/g, ' ').trim().slice(0, 10000); // Truncate text to save RAM
+      
       const seen = new Set();
       const uniqueLinks = links.filter(l => {
         if (seen.has(l.href)) return false;
@@ -125,21 +98,21 @@ export async function POST(req: Request) {
         return true;
       });
 
-      return { text, title, links: uniqueLinks.slice(0, 100) }; 
+      return { text, title, links: uniqueLinks.slice(0, 50) }; 
     });
 
-    // Step 3: Screenshot (LAST - this is where RAM usually spikes)
+    // Step 3: Screenshot (Optional & Risky)
     let screenshotBase64 = '';
     try {
-      // Added a check: only screenshot if browser is still responsive
+      // Small scale and low quality to prevent OOM crash
       const screenshot = await page.screenshot({ 
         type: 'jpeg', 
-        quality: 20, // Lower quality significantly reduces risk of RAM crash
+        quality: 15,
         scale: 'css'
       });
       screenshotBase64 = screenshot.toString('base64');
     } catch (e) {
-      console.error("Screenshot failed, returning text data only:", e.message);
+      console.error("Screenshot skipped to prevent memory crash");
     }
 
     await browser.close();
@@ -151,17 +124,13 @@ export async function POST(req: Request) {
       screenshot: screenshotBase64 ? `data:image/jpeg;base64,${screenshotBase64}` : null
     });
 
-  } catch (err) {
-    console.error("Scraping error:", err);
-    return NextResponse.json({ error: (err as Error).message }, { status: 500 });
+  } catch (err: any) {
+    console.error("Critical Scraping Error:", err.message);
+    return NextResponse.json({ error: err.message }, { status: 500 });
   } finally {
-    // CRITICAL: Guaranteed cleanup to prevent memory leaks in the serverless container
+    // Final safeguard to kill the process
     if (browser) {
-      try {
-        await browser.close();
-      } catch (e) {
-        // Browser might already be closed
-      }
+      await browser.close().catch(() => {});
     }
   }
 }
