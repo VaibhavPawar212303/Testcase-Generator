@@ -19,32 +19,79 @@ export async function POST(req: Request) {
     const { chromium } = await import('playwright-core');
     let sparticuz;
     
-    try {
-      const sparticuzModule = await import('@sparticuz/chromium-min');
-      sparticuz = (sparticuzModule as any).default || sparticuzModule;
-      
-      console.log("Attempting sparticuz-chromium-min launch...");
-      // Ensure we are using a boolean for headless as required by playwright-core
-      const isHeadless = sparticuz.headless === true || String(sparticuz.headless) === 'true' || sparticuz.headless === 'shell';
-      
-      const executablePath = await sparticuz.executablePath('https://github.com/sparticuz/chromium/releases/download/v131.0.1/chromium-v131.0.1-pack.tar');
-      
-      browser = await chromium.launch({
-        executablePath,
-        args: Array.isArray(sparticuz.args) ? [...sparticuz.args, '--disable-blink-features=AutomationControlled'] : sparticuz.args,
-        headless: !!isHeadless,
-      });
-    } catch (sparticuzError) {
-      console.warn("Sparticuz-min failed, falling back to local playwright launch:", sparticuzError);
+    const launchBrowser = async () => {
       try {
-        // Fallback for local development or full environments
-        browser = await chromium.launch({
-          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+        const sparticuzModule = await import('@sparticuz/chromium-min');
+        sparticuz = (sparticuzModule as any).default || sparticuzModule;
+        
+        console.log("Attempting sparticuz-chromium-min launch...");
+        const executablePath = await sparticuz.executablePath('https://github.com/sparticuz/chromium/releases/download/v131.0.1/chromium-v131.0.1-pack.tar');
+        
+        return await chromium.launch({
+          executablePath,
+          args: Array.isArray(sparticuz.args) ? [...sparticuz.args, '--disable-blink-features=AutomationControlled'] : sparticuz.args,
+          headless: sparticuz.headless === true || String(sparticuz.headless) === 'true' || sparticuz.headless === 'shell',
+        });
+      } catch (e) {
+        console.warn("Sparticuz launch failed, trying local chromium:", e);
+        return await chromium.launch({
+          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
           headless: true
         });
-      } catch (playwrightError) {
-        console.error("All launch methods failed:", playwrightError);
-        throw new Error(`CRITICAL: Browser launch failed. ${sparticuzError}. ${playwrightError}`);
+      }
+    };
+
+    try {
+      browser = await launchBrowser();
+    } catch (launchError) {
+      console.warn("Browser launch totally failed. Attempting Cheerio fallback...", launchError);
+      
+      // Cheerio Fallback for basic HTML scraping (prevents total failure on 4th+ URL if env flakes)
+      try {
+        const axiosModule = await import('axios');
+        const axios = axiosModule.default || axiosModule;
+        const cheerioModule = await import('cheerio');
+        const cheerio = cheerioModule.default || cheerioModule;
+        
+        const response = await axios.get(url, { 
+          timeout: 10000,
+          headers: { 
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+          }
+        });
+        
+        const $ = (cheerio.load || cheerio)(response.data);
+        
+        // Remove noise
+        $('script, style, noscript, nav, footer, header', 'body').remove();
+        const text = $('body').text().replace(/\s+/g, ' ').trim();
+        const title = $('title').text() || url;
+        const links: { href: string; text: string }[] = [];
+        
+        const baseUrl = new URL(url).origin;
+        $('a[href]', 'body').each((_, el) => {
+          const href = $(el).attr('href');
+          if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+            try {
+              const fullUrl = new URL(href, url).href;
+              if (fullUrl.startsWith(baseUrl)) {
+                links.push({ href: fullUrl, text: $(el).text().trim().slice(0, 50) });
+              }
+            } catch(e) {}
+          }
+        });
+
+        return NextResponse.json({
+          text: text.slice(0, 50000), // Limit text size for JSON stability
+          title,
+          links: Array.from(new Set(links.map(l => l.href))).map(href => links.find(l => l.href === href)).slice(0, 50),
+          screenshot: null,
+          fallback: true
+        });
+      } catch (cheerioError) {
+        throw new Error(`Browser failed AND Cheerio fallback failed: ${(cheerioError as Error).message}`);
       }
     }
     

@@ -335,12 +335,14 @@ export default function Page() {
     
     addLog(`STARTING_CRAWL: TARGETING_${deduplicatedQueue.length}_UNIQUE_NODES`);
     
+    let errorCount = 0;
+    const maxErrors = 5;
+
     for (const url of deduplicatedQueue) {
       if (!url) continue;
       const normalizedUrl = url.split('#')[0].replace(/\/$/, '');
       
       if (normalizedVisited.has(normalizedUrl)) {
-         // Already processed this page (or a variant of it)
          continue;
       }
       
@@ -348,17 +350,24 @@ export default function Page() {
         addLog(`REACHED_VIRTUAL_LIMIT_OF_${maxPages}_NODES. HALTING.`);
         break;
       }
+
+      if (errorCount >= maxErrors) {
+        addLog(`CONSECUTIVE_ERRORS_THRESHOLD_REACHED. HALTING CRAWL TO PRESERVE RESOURCES.`);
+        break;
+      }
       
       setCurrentCrawlingUrl(url);
-      addLog(`PLAYWRIGHT_DISPATCH: TARGET=${url}`);
+      addLog(`FETCH_REQUEST: ${url}`);
       
       // Increased throttle: slower crawl is more reliable in serverless and less likely to trigger rate limits
-      await new Promise(r => setTimeout(r, 1500));
+      await new Promise(r => setTimeout(r, 2000));
 
       try {
         const data = await fetchWithRetry(url);
         
         if (data.error) throw new Error(data.error);
+
+        errorCount = 0; // Reset errors on success
         
         visited.add(url);
         normalizedVisited.add(normalizedUrl);
@@ -372,13 +381,14 @@ export default function Page() {
           screenshot: data.screenshot
         });
         
-        addLog(`NODE_INGESTED: ${data.title} || ${data.links?.length || 0}_LINKS`);
+        addLog(`INGESTED: ${data.title} (${data.fallback ? 'HTML_ONLY' : 'PLAYWRIGHT'})`);
         
         // Progressively update state for UI feedback
         setCrawledData(new Map(newDataMap));
         setVisitedUrls(new Set(visited));
       } catch (err) {
-        addLog(`STREAMS_ERROR_AT_NODE: ${url} - ${(err as Error).message}`);
+        errorCount++;
+        addLog(`FAILED_NODE: ${url} - ${(err as Error).message}`);
         // Even on error, we mark as visited to avoid looping/retrying this specific URL
         normalizedVisited.add(normalizedUrl);
         console.error(`Crawl failed for ${url}`, err);
