@@ -300,16 +300,27 @@ export default function Page() {
   };
 
   const startMultiCrawl = async (initialQueue: string[], rootUrl: string) => {
-    const maxPages = 15; // Increased breadth for deeper knowledge
+    const maxPages = Math.max(50, initialQueue.length + 1); 
     const queue = initialQueue.slice(0, maxPages - 1);
     const visited = new Set([rootUrl]);
+    const normalizedVisited = new Set([rootUrl.split('#')[0].replace(/\/$/, '')]);
     const newDataMap = new Map(crawledData);
     
-    addLog(`STARTING_BREADTH_FIRST_CRAWL: LIMIT=${maxPages}_NODES`);
+    addLog(`STARTING_BREADTH_FIRST_CRAWL: TARGETING_${queue.length}_NODES`);
     
     for (const url of queue) {
-      if (visited.has(url)) continue;
-      if (visited.size >= maxPages) break;
+      if (!url) continue;
+      const normalizedUrl = url.split('#')[0].replace(/\/$/, '');
+      
+      if (normalizedVisited.has(normalizedUrl)) {
+        addLog(`SKIPPING_DUPLICATE_OR_ROOT: ${url}`);
+        continue;
+      }
+      
+      if (visited.size >= maxPages) {
+        addLog(`REACHED_VIRTUAL_LIMIT_OF_${maxPages}_NODES. HALTING.`);
+        break;
+      }
       
       setCurrentCrawlingUrl(url);
       addLog(`PLAYWRIGHT_DISPATCH: TARGET=${url}`);
@@ -327,6 +338,7 @@ export default function Page() {
         const data = await response.json();
         
         visited.add(url);
+        normalizedVisited.add(url.split('#')[0].replace(/\/$/, ''));
         newDataMap.set(url, {
           url,
           title: data.title || url,
