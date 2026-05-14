@@ -7,7 +7,8 @@ export async function POST(req: Request) {
     
     // Serverless-friendly browser launch
     const { chromium } = await import('playwright-core');
-    const sparticuzChromium = await import('@sparticuz/chromium');
+    const sparticuzModule = await import('@sparticuz/chromium');
+    const sparticuz = (sparticuzModule as any).default || sparticuzModule;
     
     // Detect if we are in a serverless environment (like Vercel)
     const isServerless = !!(process.env.VERCEL || process.env.AWS_EXECUTION_ENV); 
@@ -15,9 +16,9 @@ export async function POST(req: Request) {
     browser = await chromium.launch({
       // For Vercel, we use sparticuz chromium. 
       // For local development or this container, we fallback to standard playwright if executablePath is undefined.
-      executablePath: isServerless ? await (sparticuzChromium as any).executablePath() : undefined,
-      headless: isServerless ? (sparticuzChromium as any).headless : true,
-      args: isServerless ? (sparticuzChromium as any).args : ['--no-sandbox', '--disable-setuid-sandbox'],
+      executablePath: isServerless ? await sparticuz.executablePath() : undefined,
+      headless: isServerless ? sparticuz.headless : true,
+      args: isServerless ? sparticuz.args : ['--no-sandbox', '--disable-setuid-sandbox'],
     });
     
     const context = await browser.newContext({
