@@ -13,88 +13,77 @@ export async function POST(req: Request) {
     console.log(`Starting scrap for URL: ${url}`);
     
     // Detect environment and launch browser
-    const { chromium } = await import('playwright');
+    const { chromium } = await import('playwright-core');
+    const sparticuzModule = await import('@sparticuz/chromium-min');
+    const sparticuz = (sparticuzModule as any).default || sparticuzModule;
     
     try {
-      console.log("Attempting standard chromium launch via playwright package...");
+      console.log("Attempting sparticuz-chromium-min launch (optimized for serverless)...");
+      const executablePath = await sparticuz.executablePath('https://github.com/sparticuz/chromium/releases/download/v131.0.1/chromium-v131.0.1-pack.tar');
+      
       browser = await chromium.launch({
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+        executablePath,
+        args: [...sparticuz.args, '--disable-blink-features=AutomationControlled'],
+        headless: sparticuz.headless,
       });
-    } catch (launchError) {
-      console.warn("Standard launch failed, trying with playwright-core + sparticuz:", launchError);
+    } catch (sparticuzError) {
+      console.warn("Sparticuz-min failed, falling back to standard playwright (local/full env):", sparticuzError);
       try {
-        const { chromium: chromiumCore } = await import('playwright-core');
-        const sparticuzModule = await import('@sparticuz/chromium');
-        const sparticuz = (sparticuzModule as any).default || sparticuzModule;
-        const executablePath = await sparticuz.executablePath();
-        
-        browser = await chromiumCore.launch({
-          executablePath,
-          args: sparticuz.args,
-          headless: sparticuz.headless,
-          handleSIGINT: false,
-          handleSIGTERM: false,
-          handleSIGHUP: false
+        const playwright = await import('playwright');
+        browser = await playwright.chromium.launch({
+          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled']
         });
-      } catch (sparticuzError) {
-        console.error("All launch methods failed:", sparticuzError);
-        throw new Error(`CRITICAL: Browser launch failed. Environment missing dependencies or Chromium binary. Details: ${(launchError as Error).message}`);
+      } catch (playwrightError) {
+        console.error("All launch methods failed:", playwrightError);
+        throw new Error(`CRITICAL: Browser launch failed. Details: ${(playwrightError as Error).message}`);
       }
     }
     
+    // Add randomness to UA
+    const uas = [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    ];
+    const userAgent = uas[Math.floor(Math.random() * uas.length)];
+
     const context = await browser.newContext({
       viewport: { width: 1280, height: 800 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      userAgent,
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      }
     });
     
     const page = await context.newPage();
     
-    // Navigate and wait for loading
+    // Navigate and wait for loading - FASTER for serverless
     try {
-      await page.goto(url, { waitUntil: 'load', timeout: 30000 });
-      // Add networkidle as a secondary wait state but capped
-      await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => console.log("Network idle timeout, proceeding..."));
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      // Minor wait for some hydration
+      await page.waitForTimeout(1000);
     } catch (e) {
-      console.warn("Initial load failed/timed out, checking if body exists...", e);
+      console.warn("Initial load timed out, attempting proceed...", e);
     }
     
-    // Scroll down to trigger lazy loading
+    // Quick scroll
     await page.evaluate(async () => {
-      await new Promise((resolve) => {
-        let totalHeight = 0;
-        const distance = 200; // Faster scroll
-        const timer = setInterval(() => {
-          const body = document.body;
-          if (!body) {
-            clearInterval(timer);
-            return resolve(true);
-          }
-          const scrollHeight = body.scrollHeight;
-          window.scrollBy(0, distance);
-          totalHeight += distance;
-          if (totalHeight >= scrollHeight || totalHeight > 5000) {
-            clearInterval(timer);
-            resolve(true);
-          }
-        }, 100);
-      });
+      window.scrollBy(0, 2000);
+      await new Promise(r => setTimeout(r, 500));
+      window.scrollTo(0, 0);
     });
 
-    // Wait extra for dynamic content after scroll
-    await page.waitForTimeout(1500);
-
-    // EXTENSIVE VALIDATION BEFORE EXTRACTION
-    // Check if the page is behind a challenge/spinner or empty
+    // VALIDATION
     const checkStatus = await page.evaluate(() => {
       const text = document.body?.innerText || "";
-      const isSpinner = !!document.querySelector('.spinner, .loading, #loader, [class*="Loading"]');
-      const isEmpty = text.length < 100;
-      return { isSpinner, isEmpty, textLength: text.length };
+      const isBlocked = text.includes("Access Denied") || text.includes("Cloudflare") || document.title.includes("Attention Required");
+      return { isBlocked, textLength: text.length };
     });
 
-    if (checkStatus.isSpinner || checkStatus.isEmpty) {
-      console.log(`Detected possible loading state or empty page (Length: ${checkStatus.textLength}). Waiting 3 more seconds...`);
-      await page.waitForTimeout(3000);
+    if (checkStatus.isBlocked) {
+      throw new Error("Target site blocked the scraper (Bot detection).");
     }
     
     // Take screenshot (reduced quality to save memory)
@@ -160,7 +149,11 @@ export async function POST(req: Request) {
       return { text, title, links: uniqueLinks.slice(0, 50) }; 
     });
 
+    // CRITICAL: Explicit cleanup
+    await page.close();
+    await context.close();
     await browser.close();
+    browser = null;
     
     return NextResponse.json({ 
       text: data.text,
@@ -169,8 +162,15 @@ export async function POST(req: Request) {
       screenshot: `data:image/jpeg;base64,${screenshotBase64}`
     });
   } catch (err) {
-    if (browser) await browser.close();
     console.error("Scraping error:", err);
     return NextResponse.json({ error: (err as Error).message }, { status: 500 });
+  } finally {
+    if (browser) {
+      try {
+        await (browser as any).close();
+      } catch (e) {
+        console.error("Error closing browser in finally:", e);
+      }
+    }
   }
 }

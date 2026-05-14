@@ -339,7 +339,7 @@ export default function Page() {
       if (!url) continue;
       const normalizedUrl = url.split('#')[0].replace(/\/$/, '');
       
-      if (normalizedVisited.has(normalizedUrl) && url !== rootUrl) {
+      if (normalizedVisited.has(normalizedUrl)) {
          // Already processed this page (or a variant of it)
          continue;
       }
@@ -352,11 +352,13 @@ export default function Page() {
       setCurrentCrawlingUrl(url);
       addLog(`PLAYWRIGHT_DISPATCH: TARGET=${url}`);
       
-      // Add a small throttle to be respectful and avoid resource contention
-      await new Promise(r => setTimeout(r, 800));
+      // Increased throttle: slower crawl is more reliable in serverless and less likely to trigger rate limits
+      await new Promise(r => setTimeout(r, 1500));
 
       try {
         const data = await fetchWithRetry(url);
+        
+        if (data.error) throw new Error(data.error);
         
         visited.add(url);
         normalizedVisited.add(normalizedUrl);
