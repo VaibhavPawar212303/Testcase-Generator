@@ -3,47 +3,55 @@ import { NextResponse } from 'next/server';
 export async function POST(req: Request) {
   let browser;
   try {
-    const { url } = await req.json();
+    const body = await req.json().catch(() => ({}));
+    const { url } = body;
     
-    // Serverless-friendly browser launch
-    const { chromium } = await import('playwright-core');
-    const sparticuzModule = await import('@sparticuz/chromium');
-    const sparticuz = (sparticuzModule as any).default || sparticuzModule;
-    
-    // Detect environment
-    let executablePath;
-    try {
-      executablePath = await sparticuz.executablePath();
-      console.log("Using Chromium executable at:", executablePath);
-    } catch (e) {
-      console.error("Failed to get sparticuz executable path:", e);
+    if (!url) {
+      return NextResponse.json({ error: "Missing URL in request body" }, { status: 400 });
     }
 
-    browser = await chromium.launch({
-      executablePath: executablePath || undefined,
-      headless: true, // Force headless for server environments
-      args: [
-        ...(sparticuz.args || []),
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-zygote',
-        '--single-process' // Helps in restricted memory environments
-      ],
-    });
+    console.log(`Starting scrap for URL: ${url}`);
+    
+    // Detect environment and launch browser
+    const { chromium } = await import('playwright-core');
+    
+    try {
+      console.log("Attempting standard chromium launch...");
+      // For local/full environments where playwright is installed
+      browser = await chromium.launch({
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+      });
+    } catch (launchError) {
+      console.warn("Standard launch failed, attempting sparticuz fallback...", launchError);
+      try {
+        const sparticuzModule = await import('@sparticuz/chromium');
+        const sparticuz = (sparticuzModule as any).default || sparticuzModule;
+        const executablePath = await sparticuz.executablePath();
+        
+        browser = await chromium.launch({
+          executablePath,
+          args: sparticuz.args,
+          headless: sparticuz.headless,
+          // Extra args that help in serverless
+          handleSIGINT: false,
+          handleSIGTERM: false,
+          handleSIGHUP: false
+        });
+      } catch (sparticuzError) {
+        console.error("All launch methods failed:", sparticuzError);
+        throw new Error(`Failed to launch browser. Environment might missing dependencies. Original error: ${(launchError as Error).message}. Sparticuz error: ${(sparticuzError as Error).message}`);
+      }
+    }
     
     const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 800 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     });
     
     const page = await context.newPage();
     
-    // Set a reasonable viewport
-    await page.setViewportSize({ width: 1280, height: 800 });
-    
-    // Navigate and wait for network idle
-    await page.goto(url, { waitUntil: 'load', timeout: 30000 });
+    // Navigate and wait for loading
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     
     // Scroll down to trigger lazy loading
     await page.evaluate(async () => {
@@ -51,26 +59,33 @@ export async function POST(req: Request) {
         let totalHeight = 0;
         const distance = 100;
         const timer = setInterval(() => {
-          const scrollHeight = document.body.scrollHeight;
+          const body = document.body;
+          if (!body) {
+            clearInterval(timer);
+            return resolve(true);
+          }
+          const scrollHeight = body.scrollHeight;
           window.scrollBy(0, distance);
           totalHeight += distance;
-          if (totalHeight >= scrollHeight || totalHeight > 10000) {
+          if (totalHeight >= scrollHeight || totalHeight > 5000) { // Slightly lower limit to save time/memory
             clearInterval(timer);
             resolve(true);
           }
-        }, 100);
+        }, 150); // Slower interval
       });
     });
 
     // Wait extra for dynamic content after scroll
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1000);
     
-    // Take screenshot
-    const screenshot = await page.screenshot({ type: 'jpeg', quality: 50 });
+    // Take screenshot (reduced quality to save memory)
+    const screenshot = await page.screenshot({ type: 'jpeg', quality: 40 });
     const screenshotBase64 = screenshot.toString('base64');
     
     // Extract content and links
     const data = await page.evaluate(() => {
+      if (!document.body) return { text: '', title: '', links: [] };
+      
       // 1. Extract internal links BEFORE cleanup
       const currentUrl = window.location.href;
       const baseUrl = window.location.origin;
@@ -91,10 +106,9 @@ export async function POST(req: Request) {
           if (!link || !link.href) return false;
           try {
             const url = new URL(link.href);
-            // Allow same origin OR same root domain for docs that cross subdomains
             const isSameRootDomain = url.hostname.endsWith(rootDomain);
             const isDifferentPage = url.href.split('#')[0] !== currentUrl.split('#')[0];
-            const isNotStaticAsset = !link.href.match(/\.(png|jpg|jpeg|gif|pdf|zip|gz|svg|css|js|woff|ttf)$/i);
+            const isNotStaticAsset = !link.href.match(/\.(png|jpg|jpeg|gif|pdf|zip|gz|svg|css|js|woff|ttf|ico)$/i);
             const isNotMailOrTel = !link.href.startsWith('mailto:') && !link.href.startsWith('tel:');
             
             return isSameRootDomain && isDifferentPage && isNotStaticAsset && isNotMailOrTel;
@@ -104,7 +118,7 @@ export async function POST(req: Request) {
       const title = document.title;
 
       // 2. Cleanup for text extraction
-      const noisySelectors = ['script', 'style', 'noscript', 'header', 'footer', 'nav', 'aside', 'iframe', 'button:not([href])'];
+      const noisySelectors = ['script', 'style', 'noscript', 'header', 'footer', 'nav', 'aside', 'iframe', 'svg', 'button:not([href])'];
       noisySelectors.forEach(selector => {
         document.querySelectorAll(selector).forEach(el => el.remove());
       });
@@ -119,7 +133,7 @@ export async function POST(req: Request) {
         return true;
       });
 
-      return { text, title, links: uniqueLinks.slice(0, 100) }; 
+      return { text, title, links: uniqueLinks.slice(0, 50) }; 
     });
 
     await browser.close();

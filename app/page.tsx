@@ -238,7 +238,15 @@ export default function Page() {
   };
 
   const handleIngestUrl = async () => {
-    if (!urlInput.trim()) return;
+    let targetUrl = urlInput.trim();
+    if (!targetUrl) return;
+    
+    // Ensure protocol
+    if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
+      targetUrl = `https://${targetUrl}`;
+      setUrlInput(targetUrl);
+    }
+
     setPipelineStep('fetching');
     setShowPipelineModal(true);
     setPipelineError(null);
@@ -251,13 +259,13 @@ export default function Page() {
     setIsCrawlingFinished(false);
 
     try {
-      addLog(`INITIATING_CORE_PIPELINE: TARGET=${urlInput}`);
+      addLog(`INITIATING_CORE_PIPELINE: TARGET=${targetUrl}`);
       addLog("LAUNCHING_PLAYWRIGHT_INSTANCE...");
       // 1. Initial Fetch
       const response = await fetch('/api/fetch-url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: urlInput })
+        body: JSON.stringify({ url: targetUrl })
       });
 
       if (!response.ok) throw new Error(`Fetch failed: ${response.status}`);
