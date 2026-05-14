@@ -237,6 +237,32 @@ export default function Page() {
     return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
   };
 
+  const fetchWithRetry = async (url: string, retries = 1): Promise<any> => {
+    for (let i = 0; i <= retries; i++) {
+      try {
+        const response = await fetch('/api/fetch-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url })
+        });
+        if (!response.ok) throw new Error(`HTTP_${response.status}`);
+        const data = await response.json();
+        
+        // If text is suspiciously short, it might be a loading screen or failed render
+        if ((!data.text || data.text.length < 200) && i < retries) {
+          addLog(`PARTIAL_CONTENT_DETECTED: ${url}. ATTEMPTING_RECOVERY_${i+1}/${retries}...`);
+          await new Promise(r => setTimeout(r, 2000)); // Wait before retry
+          continue;
+        }
+        return data;
+      } catch (err) {
+        if (i === retries) throw err;
+        addLog(`NETWORK_FLAKE_DETECTED: ${url}. RETRYING...`);
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+  };
+
   const handleIngestUrl = async () => {
     let targetUrl = urlInput.trim();
     if (!targetUrl) return;
@@ -262,17 +288,9 @@ export default function Page() {
       addLog(`INITIATING_CORE_PIPELINE: TARGET=${targetUrl}`);
       addLog("LAUNCHING_PLAYWRIGHT_INSTANCE...");
       // 1. Initial Fetch
-      const response = await fetch('/api/fetch-url', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: targetUrl })
-      });
+      const data = await fetchWithRetry(targetUrl);
 
-      if (!response.ok) throw new Error(`Fetch failed: ${response.status}`);
-      const data = await response.json();
-      if (data.error) throw new Error(data.error);
-
-      addLog(`SUCCESSFULLY_NAVIGATED: ${urlInput}`);
+      addLog(`SUCCESSFULLY_NAVIGATED: ${targetUrl}`);
       addLog(`TITLE: ${data.title}`);
       addLog(`DISCOVERED_LINKS: ${data.links?.length || 0}`);
       addLog(`CRAWL_READY: SELECT_TARGET_NODES`);
@@ -333,17 +351,7 @@ export default function Page() {
       setCurrentCrawlingUrl(url);
       addLog(`PLAYWRIGHT_DISPATCH: TARGET=${url}`);
       try {
-        const response = await fetch('/api/fetch-url', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url })
-        });
-        
-        if (!response.ok) {
-           addLog(`FETCH_FAILED_FOR_NODE: ${url} (CODE: ${response.status})`);
-           continue;
-        }
-        const data = await response.json();
+        const data = await fetchWithRetry(url);
         
         visited.add(url);
         normalizedVisited.add(url.split('#')[0].replace(/\/$/, ''));
@@ -358,12 +366,13 @@ export default function Page() {
         });
         
         addLog(`NODE_INGESTED: ${data.title} || ${data.links?.length || 0}_LINKS`);
+        if (data.text.length < 300) addLog(`WARNING: LOW_CONTENT_DENSITY_AT_${url}`);
         
         // Progressively update state for UI feedback
         setCrawledData(new Map(newDataMap));
         setVisitedUrls(new Set(visited));
       } catch (err) {
-        addLog(`STREAMS_ERROR_AT_NODE: ${url}`);
+        addLog(`STREAMS_ERROR_AT_NODE: ${url} - ${(err as Error).message}`);
         console.error(`Crawl failed for ${url}`, err);
       }
     }

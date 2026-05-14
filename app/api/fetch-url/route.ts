@@ -51,13 +51,19 @@ export async function POST(req: Request) {
     const page = await context.newPage();
     
     // Navigate and wait for loading
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    try {
+      await page.goto(url, { waitUntil: 'load', timeout: 30000 });
+      // Add networkidle as a secondary wait state but capped
+      await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => console.log("Network idle timeout, proceeding..."));
+    } catch (e) {
+      console.warn("Initial load failed/timed out, checking if body exists...", e);
+    }
     
     // Scroll down to trigger lazy loading
     await page.evaluate(async () => {
       await new Promise((resolve) => {
         let totalHeight = 0;
-        const distance = 100;
+        const distance = 200; // Faster scroll
         const timer = setInterval(() => {
           const body = document.body;
           if (!body) {
@@ -67,16 +73,30 @@ export async function POST(req: Request) {
           const scrollHeight = body.scrollHeight;
           window.scrollBy(0, distance);
           totalHeight += distance;
-          if (totalHeight >= scrollHeight || totalHeight > 5000) { // Slightly lower limit to save time/memory
+          if (totalHeight >= scrollHeight || totalHeight > 5000) {
             clearInterval(timer);
             resolve(true);
           }
-        }, 150); // Slower interval
+        }, 100);
       });
     });
 
     // Wait extra for dynamic content after scroll
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(1500);
+
+    // EXTENSIVE VALIDATION BEFORE EXTRACTION
+    // Check if the page is behind a challenge/spinner or empty
+    const checkStatus = await page.evaluate(() => {
+      const text = document.body?.innerText || "";
+      const isSpinner = !!document.querySelector('.spinner, .loading, #loader, [class*="Loading"]');
+      const isEmpty = text.length < 100;
+      return { isSpinner, isEmpty, textLength: text.length };
+    });
+
+    if (checkStatus.isSpinner || checkStatus.isEmpty) {
+      console.log(`Detected possible loading state or empty page (Length: ${checkStatus.textLength}). Waiting 3 more seconds...`);
+      await page.waitForTimeout(3000);
+    }
     
     // Take screenshot (reduced quality to save memory)
     const screenshot = await page.screenshot({ type: 'jpeg', quality: 40 });
