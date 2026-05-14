@@ -1,5 +1,8 @@
 import { NextResponse } from 'next/server';
 
+export const maxDuration = 60; // 60 seconds (requires Pro plan on Vercel, but helps on many platforms)
+export const dynamic = 'force-dynamic';
+
 export async function POST(req: Request) {
   let browser;
   try {
@@ -14,28 +17,34 @@ export async function POST(req: Request) {
     
     // Detect environment and launch browser
     const { chromium } = await import('playwright-core');
-    const sparticuzModule = await import('@sparticuz/chromium-min');
-    const sparticuz = (sparticuzModule as any).default || sparticuzModule;
+    let sparticuz;
     
     try {
-      console.log("Attempting sparticuz-chromium-min launch (optimized for serverless)...");
+      const sparticuzModule = await import('@sparticuz/chromium-min');
+      sparticuz = (sparticuzModule as any).default || sparticuzModule;
+      
+      console.log("Attempting sparticuz-chromium-min launch...");
+      // Ensure we are using a boolean for headless as required by playwright-core
+      const isHeadless = sparticuz.headless === true || String(sparticuz.headless) === 'true' || sparticuz.headless === 'shell';
+      
       const executablePath = await sparticuz.executablePath('https://github.com/sparticuz/chromium/releases/download/v131.0.1/chromium-v131.0.1-pack.tar');
       
       browser = await chromium.launch({
         executablePath,
-        args: [...sparticuz.args, '--disable-blink-features=AutomationControlled'],
-        headless: sparticuz.headless,
+        args: Array.isArray(sparticuz.args) ? [...sparticuz.args, '--disable-blink-features=AutomationControlled'] : sparticuz.args,
+        headless: !!isHeadless,
       });
     } catch (sparticuzError) {
-      console.warn("Sparticuz-min failed, falling back to standard playwright (local/full env):", sparticuzError);
+      console.warn("Sparticuz-min failed, falling back to local playwright launch:", sparticuzError);
       try {
-        const playwright = await import('playwright');
-        browser = await playwright.chromium.launch({
-          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled']
+        // Fallback for local development or full environments
+        browser = await chromium.launch({
+          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+          headless: true
         });
       } catch (playwrightError) {
         console.error("All launch methods failed:", playwrightError);
-        throw new Error(`CRITICAL: Browser launch failed. Details: ${(playwrightError as Error).message}`);
+        throw new Error(`CRITICAL: Browser launch failed. ${sparticuzError}. ${playwrightError}`);
       }
     }
     
