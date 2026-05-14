@@ -19,9 +19,9 @@ export async function POST(req: Request) {
       console.error("Failed to get sparticuz executable path:", e);
     }
 
-    browser = await chromium.launch({
+    const browserOptions: any = {
       executablePath: executablePath || undefined,
-      headless: true, // Force headless for server environments
+      headless: true,
       args: [
         ...(sparticuz.args || []),
         '--no-sandbox',
@@ -29,45 +29,77 @@ export async function POST(req: Request) {
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--no-zygote',
-        '--single-process' // Helps in restricted memory environments
+        '--single-process',
+        '--disable-extensions',
       ],
-    });
+    };
+
+    browser = await chromium.launch(browserOptions);
     
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 800 },
     });
     
     const page = await context.newPage();
     
-    // Set a reasonable viewport
-    await page.setViewportSize({ width: 1280, height: 800 });
+    // speed up by avoiding heavy assets if they are not strictly needed
+    // strictly speaking, we want a screenshot, so we might need images, 
+    // but maybe we can skip them if it's too slow.
+    // For now, let's at least block trackers/analytics
+    await page.route('**/*', (route) => {
+      const url = route.request().url();
+      const resourceType = route.request().resourceType();
+      
+      const isTracker = url.includes('google-analytics') || 
+                        url.includes('doubleclick') || 
+                        url.includes('facebook.net') || 
+                        url.includes('segment.com');
+      
+      // If it's a very heavy site and we are struggling, we could block images too
+      // const blockTypes = ['image', 'media', 'font'];
+      const blockTypes = ['media']; 
+      
+      if (isTracker || blockTypes.includes(resourceType)) {
+        route.abort();
+      } else {
+        route.continue();
+      }
+    });
     
-    // Navigate and wait for network idle
-    await page.goto(url, { waitUntil: 'load', timeout: 30000 });
+    // Navigate with a shorter timeout and wait for DOMContentLoaded first
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 8000 });
+    } catch (e) {
+      console.warn("Navigation timed out for domcontentloaded, attempting to proceed anyway", e);
+    }
     
-    // Scroll down to trigger lazy loading
-    await page.evaluate(async () => {
-      await new Promise((resolve) => {
-        let totalHeight = 0;
-        const distance = 100;
-        const timer = setInterval(() => {
-          const scrollHeight = document.body.scrollHeight;
-          window.scrollBy(0, distance);
-          totalHeight += distance;
-          if (totalHeight >= scrollHeight || totalHeight > 10000) {
-            clearInterval(timer);
-            resolve(true);
-          }
-        }, 100);
-      });
+    // Optional: wait very briefly for stable state
+    try {
+      await page.waitForLoadState('load', { timeout: 2000 });
+    } catch (e) {
+      // Ignore load timeouts
+    }
+    
+    // Simplified scroll to trigger some lazy loading without long waits
+    await page.evaluate(() => {
+      window.scrollTo(0, 1000);
+      // No reset to 0 to save time, doesn't matter for scraping
     });
 
-    // Wait extra for dynamic content after scroll
-    await page.waitForTimeout(2000);
-    
-    // Take screenshot
-    const screenshot = await page.screenshot({ type: 'jpeg', quality: 50 });
-    const screenshotBase64 = screenshot.toString('base64');
+    // Take screenshot (optional, but keep it if expected)
+    let screenshotBase64 = '';
+    try {
+      // Use a smaller screenshot and lower quality to save time and memory
+      const screenshot = await page.screenshot({ 
+        type: 'jpeg', 
+        quality: 30,
+        scale: 'css'
+      });
+      screenshotBase64 = screenshot.toString('base64');
+    } catch (e) {
+      console.error("Screenshot failed:", e);
+    }
     
     // Extract content and links
     const data = await page.evaluate(() => {
