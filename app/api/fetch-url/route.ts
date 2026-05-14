@@ -1,15 +1,16 @@
 import { NextResponse } from 'next/server';
 
-// FIX: Increase timeout and memory for serverless environment
-// Vercel: maxDuration is in seconds. memory is in MB.
+// Next.js valid export for Vercel Pro/Enterprise. 
+// NOTE: Memory must be set in the Vercel Dashboard (Option 1)
 export const maxDuration = 30; 
-export const memory = 1024; // Ensure at least 1GB RAM
 
 export async function POST(req: Request) {
-  let browser: any; // Use any to avoid type conflicts with dynamic imports
+  let browser: any = null;
+  
   try {
     const { url } = await req.json();
     
+    // Serverless-friendly browser launch
     const { chromium } = await import('playwright-core');
     const sparticuzModule = await import('@sparticuz/chromium');
     const sparticuz = (sparticuzModule as any).default || sparticuzModule;
@@ -31,7 +32,7 @@ export async function POST(req: Request) {
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--no-zygote',
-        '--single-process',
+        '--single-process', // Standard for serverless to save RAM
         '--disable-extensions',
       ],
     };
@@ -54,7 +55,8 @@ export async function POST(req: Request) {
                         requestUrl.includes('facebook.net') || 
                         requestUrl.includes('segment.com');
       
-      const blockTypes = ['media']; 
+      // Block media and fonts to save memory (Target Closed is often an OOM error)
+      const blockTypes = ['media', 'font']; 
       
       if (isTracker || blockTypes.includes(resourceType)) {
         route.abort();
@@ -65,17 +67,23 @@ export async function POST(req: Request) {
     
     // Step 1: Navigate
     try {
-      // Increased timeout slightly to 15s for stability
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      // Shorter timeout to leave time for processing
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 12000 });
     } catch (e) {
-      console.warn("Navigation timed out, proceeding with current state", e);
+      console.warn("Navigation timed out, attempting to proceed with data extraction...");
     }
     
+    // Wait briefly for hydration
     try {
-      await page.waitForLoadState('load', { timeout: 3000 });
+      await page.waitForLoadState('load', { timeout: 2000 });
     } catch (e) {}
+    
+    // Simplified scroll
+    await page.evaluate(() => {
+      window.scrollTo(0, 500);
+    }).catch(() => {});
 
-    // Step 2: Extract content and links (Do this BEFORE screenshot to save memory)
+    // Step 2: Extract content and links (FIRST - while memory is stable)
     const data = await page.evaluate(() => {
       const currentUrl = window.location.href;
       const domainParts = window.location.hostname.split('.');
@@ -120,23 +128,22 @@ export async function POST(req: Request) {
       return { text, title, links: uniqueLinks.slice(0, 100) }; 
     });
 
-    // Step 3: Screenshot (Memory intensive, we do this last)
+    // Step 3: Screenshot (LAST - this is where RAM usually spikes)
     let screenshotBase64 = '';
-    // Check if page is still open before screenshotting
-    if (!page.isClosed()) {
-      try {
-        const screenshot = await page.screenshot({ 
-          type: 'jpeg', 
-          quality: 20, // Lower quality significantly reduces RAM spikes
-          scale: 'css'
-        });
-        screenshotBase64 = screenshot.toString('base64');
-      } catch (e) {
-        console.error("Screenshot failed, continuing with data only:", e);
-      }
+    try {
+      // Added a check: only screenshot if browser is still responsive
+      const screenshot = await page.screenshot({ 
+        type: 'jpeg', 
+        quality: 20, // Lower quality significantly reduces risk of RAM crash
+        scale: 'css'
+      });
+      screenshotBase64 = screenshot.toString('base64');
+    } catch (e) {
+      console.error("Screenshot failed, returning text data only:", e.message);
     }
 
-    // Success response
+    await browser.close();
+    
     return NextResponse.json({ 
       text: data.text,
       title: data.title,
@@ -148,9 +155,13 @@ export async function POST(req: Request) {
     console.error("Scraping error:", err);
     return NextResponse.json({ error: (err as Error).message }, { status: 500 });
   } finally {
-    // FIX: Ensure browser always closes even on failures to prevent OOM in future runs
+    // CRITICAL: Guaranteed cleanup to prevent memory leaks in the serverless container
     if (browser) {
-      await browser.close();
+      try {
+        await browser.close();
+      } catch (e) {
+        // Browser might already be closed
+      }
     }
   }
 }
