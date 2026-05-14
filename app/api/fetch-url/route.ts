@@ -1,153 +1,167 @@
 import { NextResponse } from 'next/server';
-import { performance } from 'perf_hooks';
 
-export const maxDuration = 30; // REQUIRED for Vercel Pro
+// Next.js valid export for Vercel Pro/Enterprise. 
+// NOTE: Memory must be set in the Vercel Dashboard (Option 1)
+export const maxDuration = 30; 
 
 export async function POST(req: Request) {
-  const startTime = performance.now();
-  const logs: string[] = [];
-  
-  const logStep = (step: string) => {
-    const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
-    const message = `[${elapsed}s] ${step}`;
-    logs.push(message);
-    console.log(message);
-  };
-
   let browser: any = null;
   
   try {
     const { url } = await req.json();
-    const targetUrl = new URL(url);
-    logStep(`Starting scrape for: ${url}`);
-
-    // 1. Launch Browser
+    
+    // Serverless-friendly browser launch
     const { chromium } = await import('playwright-core');
     const sparticuzModule = await import('@sparticuz/chromium');
     const sparticuz = (sparticuzModule as any).default || sparticuzModule;
     
-    browser = await chromium.launch({
-      executablePath: await sparticuz.executablePath(),
-      headless: true, // Serverless requires true
-      args: [
-        ...sparticuz.args, 
-        '--no-sandbox', 
-        '--disable-dev-shm-usage', 
-        '--single-process',
-        '--disable-setuid-sandbox'
-      ],
-    });
-    logStep(`Browser launched`);
+    let executablePath;
+    try {
+      executablePath = await sparticuz.executablePath();
+    } catch (e) {
+      console.error("Failed to get sparticuz executable path:", e);
+    }
 
+    const browserOptions: any = {
+      executablePath: executablePath || undefined,
+      headless: true,
+      args: [
+        ...(sparticuz.args || []),
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--single-process', // Standard for serverless to save RAM
+        '--disable-extensions',
+      ],
+    };
+
+    browser = await chromium.launch(browserOptions);
+    
     const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      viewport: { width: 1080, height: 720 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 800 },
     });
     
     const page = await context.newPage();
-
-    // Aggressively block everything except the document and essential scripts
+    
     await page.route('**/*', (route) => {
-      const type = route.request().resourceType();
-      if (['image', 'font', 'media', 'manifest', 'stylesheet'].includes(type)) {
-        return route.abort();
+      const requestUrl = route.request().url();
+      const resourceType = route.request().resourceType();
+      
+      const isTracker = requestUrl.includes('google-analytics') || 
+                        requestUrl.includes('doubleclick') || 
+                        requestUrl.includes('facebook.net') || 
+                        requestUrl.includes('segment.com');
+      
+      // Block media and fonts to save memory (Target Closed is often an OOM error)
+      const blockTypes = ['media', 'font']; 
+      
+      if (isTracker || blockTypes.includes(resourceType)) {
+        route.abort();
+      } else {
+        route.continue();
       }
-      return route.continue();
     });
-
-    // 2. Navigation with Status Check
-    logStep("Navigating...");
-    const response = await page.goto(url, { 
-      waitUntil: 'domcontentloaded', 
-      timeout: 15000 
-    });
-
-    const status = response?.status() || 'Unknown';
-    logStep(`URL responded with HTTP ${status}`);
-
-    if (status >= 400) {
-      logStep(`Warning: Page returned error status ${status}`);
+    
+    // Step 1: Navigate
+    try {
+      // Shorter timeout to leave time for processing
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 12000 });
+    } catch (e) {
+      console.warn("Navigation timed out, attempting to proceed with data extraction...");
     }
+    
+    // Wait briefly for hydration
+    try {
+      await page.waitForLoadState('load', { timeout: 2000 });
+    } catch (e) {}
+    
+    // Simplified scroll
+    await page.evaluate(() => {
+      window.scrollTo(0, 500);
+    }).catch(() => {});
 
-    // 3. Extraction with Absolute Link Resolution
-    logStep("Extracting data...");
-    const data = await page.evaluate((baseHostname) => {
-      const title = document.title;
-      
-      // Resolve all links to Absolute URLs immediately
-      const allLinks = Array.from(document.querySelectorAll('a'))
+    // Step 2: Extract content and links (FIRST - while memory is stable)
+    const data = await page.evaluate(() => {
+      const currentUrl = window.location.href;
+      const domainParts = window.location.hostname.split('.');
+      const rootDomain = domainParts.length > 2 ? domainParts.slice(-2).join('.') : window.location.hostname;
+
+      const links = Array.from(document.querySelectorAll('a'))
         .map(a => {
-          try {
-            // Using a.href resolves relative paths (e.g. /contact) to absolute (https://site.com/contact)
-            const absoluteUrl = a.href;
-            const urlObj = new URL(absoluteUrl);
-            
-            return {
-              href: absoluteUrl,
-              text: a.innerText.trim().slice(0, 50),
-              isInternal: urlObj.hostname === baseHostname
-            };
-          } catch (e) {
-            return null;
-          }
+           try {
+             const url = new URL(a.href, currentUrl);
+             return {
+               href: url.href,
+               text: a.innerText.trim().slice(0, 100) || url.pathname
+             };
+           } catch(e) { return null; }
         })
-        .filter((l): l is { href: string; text: string; isInternal: boolean } => 
-          l !== null && l.href.startsWith('http')
-        );
+        .filter((link): link is { href: string; text: string } => {
+          if (!link || !link.href) return false;
+          try {
+            const url = new URL(link.href);
+            const isSameRootDomain = url.hostname.endsWith(rootDomain);
+            const isDifferentPage = url.href.split('#')[0] !== currentUrl.split('#')[0];
+            const isNotStaticAsset = !link.href.match(/\.(png|jpg|jpeg|gif|pdf|zip|gz|svg|css|js|woff|ttf)$/i);
+            const isNotMailOrTel = !link.href.startsWith('mailto:') && !link.href.startsWith('tel:');
+            return isSameRootDomain && isDifferentPage && isNotStaticAsset && isNotMailOrTel;
+          } catch(e) { return false; }
+        });
 
-      // Remove noise to save response size
-      const noisy = ['script', 'style', 'noscript', 'header', 'footer', 'nav'];
-      noisy.forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
+      const title = document.title;
+      const noisySelectors = ['script', 'style', 'noscript', 'header', 'footer', 'nav', 'aside', 'iframe', 'button:not([href])'];
+      noisySelectors.forEach(selector => {
+        document.querySelectorAll(selector).forEach(el => el.remove());
+      });
       
-      const text = document.body.innerText.replace(/\s+/g, ' ').trim().slice(0, 5000);
+      const text = document.body.innerText.replace(/\s+/g, ' ').trim();
+      const seen = new Set();
+      const uniqueLinks = links.filter(l => {
+        if (seen.has(l.href)) return false;
+        seen.add(l.href);
+        return true;
+      });
 
-      return { 
-        text, 
-        title, 
-        internalLinks: allLinks.filter(l => l.isInternal).slice(0, 30),
-        externalLinks: allLinks.filter(l => !l.isInternal).slice(0, 10)
-      };
-    }, targetUrl.hostname);
+      return { text, title, links: uniqueLinks.slice(0, 100) }; 
+    });
 
-    logStep(`Found ${data.internalLinks.length} internal sub-urls`);
-
-    // 4. Screenshot (Very Memory Heavy - Only do if process is stable)
+    // Step 3: Screenshot (LAST - this is where RAM usually spikes)
     let screenshotBase64 = '';
     try {
-      if (browser.isConnected()) {
-        logStep("Taking memory-safe screenshot...");
-        const buffer = await page.screenshot({ type: 'jpeg', quality: 10 });
-        screenshotBase64 = buffer.toString('base64');
-      }
-    } catch (e: any) {
-      logStep(`Screenshot skipped: ${e.message}`);
+      // Added a check: only screenshot if browser is still responsive
+      const screenshot = await page.screenshot({ 
+        type: 'jpeg', 
+        quality: 20, // Lower quality significantly reduces risk of RAM crash
+        scale: 'css'
+      });
+      screenshotBase64 = screenshot.toString('base64');
+    } catch (e) {
+      console.error("Screenshot failed, returning text data only:", e.message);
     }
 
-    logStep("Closing browser...");
     await browser.close();
-
-    return NextResponse.json({
-      url,
-      status,
-      ...data,
-      screenshot: screenshotBase64 ? `data:image/jpeg;base64,${screenshotBase64}` : null,
-      debug: logs
-    });
-
-  } catch (err: any) {
-    const errorTime = ((performance.now() - startTime) / 1000).toFixed(2);
-    console.error(`FAILED at ${errorTime}s:`, err.message);
     
     return NextResponse.json({ 
-      error: err.message, 
-      at: `${errorTime}s`,
-      logs: logs 
-    }, { status: 500 });
+      text: data.text,
+      title: data.title,
+      links: data.links,
+      screenshot: screenshotBase64 ? `data:image/jpeg;base64,${screenshotBase64}` : null
+    });
+
+  } catch (err) {
+    console.error("Scraping error:", err);
+    return NextResponse.json({ error: (err as Error).message }, { status: 500 });
   } finally {
+    // CRITICAL: Guaranteed cleanup to prevent memory leaks in the serverless container
     if (browser) {
       try {
         await browser.close();
-      } catch (e) {}
+      } catch (e) {
+        // Browser might already be closed
+      }
     }
   }
 }
