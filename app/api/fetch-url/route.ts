@@ -1,136 +1,117 @@
 import { NextResponse } from 'next/server';
+import { performance } from 'perf_hooks';
 
-// REQUIRED: You must set these in Vercel Dashboard for this route
 export const maxDuration = 30; 
 
 export async function POST(req: Request) {
+  const startTime = performance.now();
+  const logs: string[] = [];
+  
+  const logStep = (step: string) => {
+    const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+    const message = `[${elapsed}s] ${step}`;
+    logs.push(message);
+    console.log(message);
+  };
+
   let browser: any = null;
   
   try {
     const { url } = await req.json();
-    
+    logStep(`Starting scrape for: ${url}`);
+
+    // 1. Launch Browser
+    const launchStart = performance.now();
     const { chromium } = await import('playwright-core');
     const sparticuzModule = await import('@sparticuz/chromium');
     const sparticuz = (sparticuzModule as any).default || sparticuzModule;
     
-    const executablePath = await sparticuz.executablePath();
-
     browser = await chromium.launch({
-      executablePath,
+      executablePath: await sparticuz.executablePath(),
       headless: true,
-      args: [
-        ...sparticuz.args,
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-zygote',
-      ],
+      args: [...sparticuz.args, '--no-sandbox', '--disable-dev-shm-usage', '--single-process'],
     });
-    
+    logStep(`Browser launched (took ${((performance.now() - launchStart) / 1000).toFixed(2)}s)`);
+
     const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      viewport: { width: 1080, height: 720 }, // Smaller viewport = less RAM
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      viewport: { width: 1080, height: 720 },
     });
-    
     const page = await context.newPage();
-    
-    // FIX: Aggressive Blocking. 
-    // Crashing is usually due to heavy images/fonts filling up the 1GB RAM limit.
+
+    // Block heavy resources
     await page.route('**/*', (route) => {
       const type = route.request().resourceType();
-      if (['image', 'font', 'media', 'manifest', 'other'].includes(type)) {
-        return route.abort();
-      }
+      if (['image', 'font', 'media', 'other'].includes(type)) return route.abort();
       return route.continue();
     });
-    
-    // Step 1: Navigate with strict timeout
+
+    // 2. Navigation
+    logStep("Navigating to URL...");
+    const navStart = performance.now();
     try {
-      // If on Vercel Hobby, total time is 10s. We must stop navigation at 7s.
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 7000 });
-    } catch (e) {
-      console.warn("Navigation timeout, trying to extract what we have.");
+      // We set a 15s timeout for navigation
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      logStep(`Navigation finished (took ${((performance.now() - navStart) / 1000).toFixed(2)}s)`);
+    } catch (e: any) {
+      logStep(`Navigation warning: ${e.message}`);
     }
-    
-    // Step 2: Extract content and links
-    // We do this immediately. If evaluate crashes here, the page was too heavy for serverless.
+
+    // Check if browser is still alive after navigation
+    if (browser.isConnected() === false || page.isClosed()) {
+      throw new Error("Browser process crashed during navigation (likely Out of Memory)");
+    }
+
+    // 3. Extraction
+    logStep("Starting evaluation...");
+    const evalStart = performance.now();
     const data = await page.evaluate(() => {
-      const currentUrl = window.location.href;
-      const domainParts = window.location.hostname.split('.');
-      const rootDomain = domainParts.length > 2 ? domainParts.slice(-2).join('.') : window.location.hostname;
-
-      const links = Array.from(document.querySelectorAll('a'))
-        .map(a => {
-           try {
-             const urlObj = new URL(a.href, currentUrl);
-             return {
-               href: urlObj.href,
-               text: a.innerText.trim().slice(0, 80) || urlObj.pathname
-             };
-           } catch(e) { return null; }
-        })
-        .filter((link): link is { href: string; text: string } => {
-          if (!link || !link.href) return false;
-          try {
-            const u = new URL(link.href);
-            const isSameRootDomain = u.hostname.endsWith(rootDomain);
-            const isDifferentPage = u.href.split('#')[0] !== currentUrl.split('#')[0];
-            const isNotStaticAsset = !link.href.match(/\.(png|jpg|jpeg|gif|pdf|zip|gz|svg|css|js|woff|ttf)$/i);
-            return isSameRootDomain && isDifferentPage && isNotStaticAsset;
-          } catch(e) { return false; }
-        });
-
       const title = document.title;
+      const noisySelectors = ['script', 'style', 'noscript', 'header', 'footer', 'nav', 'aside'];
+      noisySelectors.forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
       
-      // Cleanup DOM to free up memory before getting innerText
-      const noisySelectors = ['script', 'style', 'noscript', 'header', 'footer', 'nav', 'aside', 'iframe'];
-      noisySelectors.forEach(selector => {
-        document.querySelectorAll(selector).forEach(el => el.remove());
-      });
-      
-      const text = document.body.innerText.replace(/\s+/g, ' ').trim().slice(0, 10000); // Truncate text to save RAM
-      
-      const seen = new Set();
-      const uniqueLinks = links.filter(l => {
-        if (seen.has(l.href)) return false;
-        seen.add(l.href);
-        return true;
-      });
+      const text = document.body.innerText.replace(/\s+/g, ' ').trim().slice(0, 8000);
+      const links = Array.from(document.querySelectorAll('a'))
+        .slice(0, 50)
+        .map(a => ({ href: a.href, text: a.innerText.trim() }))
+        .filter(l => l.href.startsWith('http'));
 
-      return { text, title, links: uniqueLinks.slice(0, 50) }; 
+      return { text, title, links };
     });
+    logStep(`Evaluation finished (took ${((performance.now() - evalStart) / 1000).toFixed(2)}s)`);
 
-    // Step 3: Screenshot (Optional & Risky)
+    // 4. Screenshot
     let screenshotBase64 = '';
-    try {
-      // Small scale and low quality to prevent OOM crash
-      const screenshot = await page.screenshot({ 
-        type: 'jpeg', 
-        quality: 15,
-        scale: 'css'
-      });
-      screenshotBase64 = screenshot.toString('base64');
-    } catch (e) {
-      console.error("Screenshot skipped to prevent memory crash");
+    if (!page.isClosed()) {
+      logStep("Attempting screenshot...");
+      try {
+        const buffer = await page.screenshot({ type: 'jpeg', quality: 15 });
+        screenshotBase64 = buffer.toString('base64');
+        logStep("Screenshot successful");
+      } catch (e: any) {
+        logStep(`Screenshot failed: ${e.message}`);
+      }
     }
 
+    logStep("Scrape complete. Closing browser.");
     await browser.close();
-    
-    return NextResponse.json({ 
-      text: data.text,
-      title: data.title,
-      links: data.links,
-      screenshot: screenshotBase64 ? `data:image/jpeg;base64,${screenshotBase64}` : null
+
+    return NextResponse.json({
+      ...data,
+      screenshot: screenshotBase64 ? `data:image/jpeg;base64,${screenshotBase64}` : null,
+      debugLogs: logs
     });
 
   } catch (err: any) {
-    console.error("Critical Scraping Error:", err.message);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    const errorTime = ((performance.now() - startTime) / 1000).toFixed(2);
+    console.error(`[${errorTime}s] CRITICAL ERROR:`, err.message);
+    
+    return NextResponse.json({ 
+      error: err.message, 
+      at: `${errorTime}s`,
+      logs: logs 
+    }, { status: 500 });
   } finally {
-    // Final safeguard to kill the process
-    if (browser) {
-      await browser.close().catch(() => {});
-    }
+    if (browser) await browser.close().catch(() => {});
   }
 }
