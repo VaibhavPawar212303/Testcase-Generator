@@ -10,15 +10,27 @@ export async function POST(req: Request) {
     const sparticuzModule = await import('@sparticuz/chromium');
     const sparticuz = (sparticuzModule as any).default || sparticuzModule;
     
-    // Detect if we are in a serverless environment (like Vercel)
-    const isServerless = !!(process.env.VERCEL || process.env.AWS_EXECUTION_ENV); 
+    // Detect environment
+    let executablePath;
+    try {
+      executablePath = await sparticuz.executablePath();
+      console.log("Using Chromium executable at:", executablePath);
+    } catch (e) {
+      console.error("Failed to get sparticuz executable path:", e);
+    }
 
     browser = await chromium.launch({
-      // For Vercel, we use sparticuz chromium. 
-      // For local development or this container, we fallback to standard playwright if executablePath is undefined.
-      executablePath: isServerless ? await sparticuz.executablePath() : undefined,
-      headless: isServerless ? sparticuz.headless : true,
-      args: isServerless ? sparticuz.args : ['--no-sandbox', '--disable-setuid-sandbox'],
+      executablePath: executablePath || undefined,
+      headless: true, // Force headless for server environments
+      args: [
+        ...(sparticuz.args || []),
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--single-process' // Helps in restricted memory environments
+      ],
     });
     
     const context = await browser.newContext({
@@ -31,27 +43,91 @@ export async function POST(req: Request) {
     await page.setViewportSize({ width: 1280, height: 800 });
     
     // Navigate and wait for network idle
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.goto(url, { waitUntil: 'load', timeout: 30000 });
     
-    // Optional: Wait extra for dynamic content
+    // Scroll down to trigger lazy loading
+    await page.evaluate(async () => {
+      await new Promise((resolve) => {
+        let totalHeight = 0;
+        const distance = 100;
+        const timer = setInterval(() => {
+          const scrollHeight = document.body.scrollHeight;
+          window.scrollBy(0, distance);
+          totalHeight += distance;
+          if (totalHeight >= scrollHeight || totalHeight > 10000) {
+            clearInterval(timer);
+            resolve(true);
+          }
+        }, 100);
+      });
+    });
+
+    // Wait extra for dynamic content after scroll
     await page.waitForTimeout(2000);
     
     // Take screenshot
     const screenshot = await page.screenshot({ type: 'jpeg', quality: 50 });
     const screenshotBase64 = screenshot.toString('base64');
     
-    // Extract content
-    const text = await page.evaluate(() => {
-      // Remove noisy elements
-      const scripts = document.querySelectorAll('script, style, nav, footer, header, noscript');
-      scripts.forEach(s => s.remove());
-      return document.body.innerText.replace(/\s+/g, ' ').trim();
+    // Extract content and links
+    const data = await page.evaluate(() => {
+      // 1. Extract internal links BEFORE cleanup
+      const currentUrl = window.location.href;
+      const baseUrl = window.location.origin;
+      const domainParts = window.location.hostname.split('.');
+      const rootDomain = domainParts.length > 2 ? domainParts.slice(-2).join('.') : window.location.hostname;
+
+      const links = Array.from(document.querySelectorAll('a'))
+        .map(a => {
+           try {
+             const url = new URL(a.href, currentUrl);
+             return {
+               href: url.href,
+               text: a.innerText.trim().slice(0, 100) || url.pathname
+             };
+           } catch(e) { return null; }
+        })
+        .filter((link): link is { href: string; text: string } => {
+          if (!link || !link.href) return false;
+          try {
+            const url = new URL(link.href);
+            // Allow same origin OR same root domain for docs that cross subdomains
+            const isSameRootDomain = url.hostname.endsWith(rootDomain);
+            const isDifferentPage = url.href.split('#')[0] !== currentUrl.split('#')[0];
+            const isNotStaticAsset = !link.href.match(/\.(png|jpg|jpeg|gif|pdf|zip|gz|svg|css|js|woff|ttf)$/i);
+            const isNotMailOrTel = !link.href.startsWith('mailto:') && !link.href.startsWith('tel:');
+            
+            return isSameRootDomain && isDifferentPage && isNotStaticAsset && isNotMailOrTel;
+          } catch(e) { return false; }
+        });
+
+      const title = document.title;
+
+      // 2. Cleanup for text extraction
+      const noisySelectors = ['script', 'style', 'noscript', 'header', 'footer', 'nav', 'aside', 'iframe', 'button:not([href])'];
+      noisySelectors.forEach(selector => {
+        document.querySelectorAll(selector).forEach(el => el.remove());
+      });
+      
+      const text = document.body.innerText.replace(/\s+/g, ' ').trim();
+      
+      // Deduplicate by href
+      const seen = new Set();
+      const uniqueLinks = links.filter(l => {
+        if (seen.has(l.href)) return false;
+        seen.add(l.href);
+        return true;
+      });
+
+      return { text, title, links: uniqueLinks.slice(0, 100) }; 
     });
 
     await browser.close();
     
     return NextResponse.json({ 
-      text, 
+      text: data.text,
+      title: data.title,
+      links: data.links,
       screenshot: `data:image/jpeg;base64,${screenshotBase64}`
     });
   } catch (err) {

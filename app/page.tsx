@@ -26,13 +26,15 @@ import {
   Sun,
   Moon,
   Settings,
-  Info
+  Info,
+  Share2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { GoogleGenAI } from "@google/genai";
 import ReactMarkdown from 'react-markdown';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import MindmapView from '@/components/MindmapView';
 
 // Helper for tailwind class merging
 function cn(...inputs: ClassValue[]) {
@@ -68,7 +70,7 @@ const ai = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY || '
 // Given the environment constraints, process.env.GEMINI_API_KEY is available.
 
 export default function Page() {
-  const [activeTab, setActiveTab] = useState<'chat' | 'stats' | 'profile' | 'settings'>('chat');
+  const [activeTab, setActiveTab] = useState<'chat' | 'stats' | 'mindmap' | 'profile' | 'settings'>('chat');
   const [knowledgeBase, setKnowledgeBase] = useState<DocChunk[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([
     { id: '1', role: 'system', content: '// KNOWLEDGE TERMINAL v1.1.0 READY. SELECT PROCESSING NODE.' }
@@ -88,6 +90,7 @@ export default function Page() {
   const [selectedModel, setSelectedModel] = useState('gemini-3-flash-preview');
   const [availableModels, setAvailableModels] = useState<any[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [currentProcessingUrl, setCurrentProcessingUrl] = useState<string | null>(null);
   const [tokenUsage, setTokenUsage] = useState({
     promptTokens: 0,
     candidatesTokens: 0,
@@ -95,13 +98,32 @@ export default function Page() {
   });
   
   // Pipeline States
-  const [pipelineStep, setPipelineStep] = useState<'idle' | 'fetching' | 'review_raw' | 'processing_ai' | 'review_processed' | 'chunking' | 'finished'>('idle');
-  const [rawFetchedText, setRawFetchedText] = useState('');
+  const [pipelineStep, setPipelineStep] = useState<'idle' | 'fetching' | 'review_root' | 'crawling' | 'review_crawl' | 'processing_ai' | 'review_ai' | 'finished'>('idle');
   const [processedAiText, setProcessedAiText] = useState('');
-  const [pipelineChunks, setPipelineChunks] = useState<{ id: string; text: string }[]>([]);
   const [showPipelineModal, setShowPipelineModal] = useState(false);
   const [pipelineError, setPipelineError] = useState<string | null>(null);
   const [scrapingScreenshot, setScrapingScreenshot] = useState<string | null>(null);
+  const [crawlLogs, setCrawlLogs] = useState<string[]>([]);
+  const [selectedLinksForCrawl, setSelectedLinksForCrawl] = useState<Set<string>>(new Set());
+
+  const addLog = (msg: string) => {
+    setCrawlLogs(prev => [...prev.slice(-49), `[${new Date().toLocaleTimeString()}] ${msg}`]);
+  };
+
+  // Advanced Mapping & Crawling States
+  const [crawledData, setCrawledData] = useState<Map<string, { 
+    url: string; 
+    title: string; 
+    text: string; 
+    links: { href: string; text: string }[]; 
+    processedText: string; 
+    chunks: { id: string; text: string }[];
+    screenshot?: string;
+  }>>(new Map());
+  const [selectedNodeUrl, setSelectedNodeUrl] = useState<string | null>(null);
+  const [visitedUrls, setVisitedUrls] = useState<Set<string>>(new Set());
+  const [currentCrawlingUrl, setCurrentCrawlingUrl] = useState<string | null>(null);
+  const [isCrawlingFinished, setIsCrawlingFinished] = useState(false);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
 
@@ -220,102 +242,195 @@ export default function Page() {
     setPipelineStep('fetching');
     setShowPipelineModal(true);
     setPipelineError(null);
-    setRawFetchedText('');
     setProcessedAiText('');
-    setPipelineChunks([]);
     setScrapingScreenshot(null);
+    
+    // Reset crawl states
+    setCrawledData(new Map());
+    setVisitedUrls(new Set());
+    setIsCrawlingFinished(false);
 
     try {
+      addLog(`INITIATING_CORE_PIPELINE: TARGET=${urlInput}`);
+      addLog("LAUNCHING_PLAYWRIGHT_INSTANCE...");
+      // 1. Initial Fetch
       const response = await fetch('/api/fetch-url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: urlInput })
       });
 
-      if (!response.ok) {
-        let errorMessage = `Fetch failed: ${response.status}`;
-        try {
-          const errorData = await response.json();
-          errorMessage = errorData.error || errorMessage;
-        } catch (e) {}
-        throw new Error(errorMessage);
-      }
+      if (!response.ok) throw new Error(`Fetch failed: ${response.status}`);
       const data = await response.json();
       if (data.error) throw new Error(data.error);
 
-      setRawFetchedText(data.text);
-      if (data.screenshot) {
-        setScrapingScreenshot(data.screenshot);
-      }
-      setPipelineStep('review_raw');
+      addLog(`SUCCESSFULLY_NAVIGATED: ${urlInput}`);
+      addLog(`TITLE: ${data.title}`);
+      addLog(`DISCOVERED_LINKS: ${data.links?.length || 0}`);
+      addLog(`CRAWL_READY: SELECT_TARGET_NODES`);
+
+      // Store initial page
+      const rootUrl = urlInput;
+      const initialEntry = {
+        url: rootUrl,
+        title: data.title || rootUrl,
+        text: data.text,
+        links: data.links || [],
+        processedText: '',
+        chunks: [],
+        screenshot: data.screenshot
+      };
+      
+      if (data.screenshot) setScrapingScreenshot(data.screenshot);
+      
+      // Update data immediately for mindmap visibility
+      const newMap = new Map();
+      newMap.set(rootUrl, initialEntry);
+      setCrawledData(newMap);
+      setVisitedUrls(new Set([rootUrl]));
+      setSelectedLinksForCrawl(new Set((data.links || []).map((l: any) => l.href)));
+
+      addLog(`ROOT_DISCOVERY_COMPLETE. AWAITING_USER_CONFIRMATION.`);
+      setPipelineStep('review_root');
     } catch (err) {
-      console.error("URL Fetch failed", err);
+      addLog(`CRITICAL_PIPELINE_ERROR: ${(err as Error).message}`);
+      console.error("URL Ingestion failed", err);
       setPipelineError((err as Error).message);
     }
   };
 
-  const handleAiProcess = async () => {
-    setPipelineStep('processing_ai');
-    setPipelineError(null);
-    try {
-      const result = await ai.models.generateContent({
-        model: selectedModel,
-        contents: `Extract the most important technical or factual information from this raw text and format it as a consolidated, clean knowledge base text. Focus on facts and useful details.\n\nRAW TEXT:\n${rawFetchedText}`,
-        config: {
-          systemInstruction: "You are a data extraction specialist. Convert messy website text into a clean, factual knowledge summary."
+  const startMultiCrawl = async (initialQueue: string[], rootUrl: string) => {
+    const maxPages = 15; // Increased breadth for deeper knowledge
+    const queue = initialQueue.slice(0, maxPages - 1);
+    const visited = new Set([rootUrl]);
+    const newDataMap = new Map(crawledData);
+    
+    addLog(`STARTING_BREADTH_FIRST_CRAWL: LIMIT=${maxPages}_NODES`);
+    
+    for (const url of queue) {
+      if (visited.has(url)) continue;
+      if (visited.size >= maxPages) break;
+      
+      setCurrentCrawlingUrl(url);
+      addLog(`PLAYWRIGHT_DISPATCH: TARGET=${url}`);
+      try {
+        const response = await fetch('/api/fetch-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url })
+        });
+        
+        if (!response.ok) {
+           addLog(`FETCH_FAILED_FOR_NODE: ${url} (CODE: ${response.status})`);
+           continue;
         }
-      });
-      
-      if (result.usageMetadata) {
-        setTokenUsage(prev => ({
-          promptTokens: prev.promptTokens + (result.usageMetadata?.promptTokenCount || 0),
-          candidatesTokens: prev.candidatesTokens + (result.usageMetadata?.candidatesTokenCount || 0),
-          totalTokens: prev.totalTokens + (result.usageMetadata?.totalTokenCount || 0)
-        }));
+        const data = await response.json();
+        
+        visited.add(url);
+        newDataMap.set(url, {
+          url,
+          title: data.title || url,
+          text: data.text,
+          links: data.links || [],
+          processedText: '',
+          chunks: [],
+          screenshot: data.screenshot
+        });
+        
+        addLog(`NODE_INGESTED: ${data.title} || ${data.links?.length || 0}_LINKS`);
+        
+        // Progressively update state for UI feedback
+        setCrawledData(new Map(newDataMap));
+        setVisitedUrls(new Set(visited));
+      } catch (err) {
+        addLog(`STREAMS_ERROR_AT_NODE: ${url}`);
+        console.error(`Crawl failed for ${url}`, err);
       }
-      
-      const extractedText = result.text || "";
-      setProcessedAiText(extractedText);
-      setPipelineStep('review_processed');
-    } catch (err) {
-      console.error("AI Processing failed", err);
-      setPipelineError((err as Error).message);
     }
+    
+    addLog(`CRAWL_FINISHED: ${visited.size}_NODES_IN_GRAPH`);
+    setCurrentCrawlingUrl(null);
+    setIsCrawlingFinished(true);
+    setPipelineStep('review_crawl');
   };
 
-  const handleGenerateChunks = () => {
-    setPipelineStep('chunking');
-    // Simulate a small delay for "chunking" effect
-    setTimeout(() => {
-      const chunks = processedAiText.split('\n\n').filter(p => p.trim()).map(text => ({
-        id: crypto.randomUUID(),
-        text: text
-      }));
-      setPipelineChunks(chunks);
-      setPipelineStep('finished');
-    }, 1000);
+  const handleProceedToAi = async () => {
+    await processAllCrawledData(crawledData);
+  };
+
+  const processAllCrawledData = async (dataMap: Map<string, any>) => {
+    setPipelineStep('processing_ai');
+    addLog("SHRINKING_KNOWLEDGE_SURFACE: AI_RESTRUCTURING...");
+    const processedMap = new Map(dataMap);
+    
+    for (const [url, entry] of processedMap.entries()) {
+      setCurrentProcessingUrl(url);
+      addLog(`AI_AGENT_ANALYZING: ${entry.title}`);
+      try {
+        const result = await ai.models.generateContent({
+          model: selectedModel,
+          contents: `Extract technical facts from this text. SOURCE: ${url}\n\nRAW:\n${entry.text}`,
+          config: {
+            systemInstruction: "You are a data extraction specialist. Convert website text into clean knowledge facts."
+          }
+        });
+        
+        if (result.usageMetadata) {
+          setTokenUsage(prev => ({
+            promptTokens: prev.promptTokens + (result.usageMetadata?.promptTokenCount || 0),
+            candidatesTokens: prev.candidatesTokens + (result.usageMetadata?.candidatesTokenCount || 0),
+            totalTokens: prev.totalTokens + (result.usageMetadata?.totalTokenCount || 0)
+          }));
+        }
+
+        const extractedText = result.text || "";
+        entry.processedText = extractedText;
+        
+        // Automated Chunking for this entry
+        const chunks = extractedText.split('\n\n').filter((p: string) => p.trim()).map((text: string) => ({
+          id: crypto.randomUUID(),
+          text: text
+        }));
+        entry.chunks = chunks;
+        
+        processedMap.set(url, { ...entry });
+        setCrawledData(new Map(processedMap));
+        addLog(`AI_EXTRACTION_COMPLETE: ${chunks.length}_FACTS_STORED`);
+      } catch (err) {
+        addLog(`AI_PROCESSING_FAILURE_AT: ${url}`);
+        console.error(`AI processing failed for ${url}`, err);
+      }
+    }
+    
+    addLog("KNOWLEDGE_INTEGRATION_SYNCED. STANDING_BY.");
+    setCurrentProcessingUrl(null);
+    setPipelineStep('review_ai');
   };
 
   const handleSavePipelineChunks = async () => {
     setIsProcessing(true);
     try {
       const newDocs: DocChunk[] = [];
-      for (const chunk of pipelineChunks) {
-        const embedding = await getEmbedding(chunk.text);
-        newDocs.push({
-          id: chunk.id,
-          text: chunk.text,
-          embedding,
-          metadata: {
-            source: urlInput,
-            createdAt: Date.now()
-          }
-        });
+      
+      // Iterate through all crawled data
+      for (const [url, entry] of crawledData.entries()) {
+        for (const chunk of entry.chunks) {
+          const embedding = await getEmbedding(chunk.text);
+          newDocs.push({
+            id: chunk.id,
+            text: chunk.text,
+            embedding,
+            metadata: {
+              source: url,
+              createdAt: Date.now()
+            }
+          });
+        }
       }
 
       const updatedKB = [...knowledgeBase, ...newDocs];
       await saveKnowledge(updatedKB);
-      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', content: `// PIPELINE_COMPLETED: ADDED ${newDocs.length} CHUNKS FROM ${urlInput}` }]);
+      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', content: `// PIPELINE_COMPLETED: ADDED ${newDocs.length} CHUNKS FROM ${crawledData.size} PAGES` }]);
       setShowPipelineModal(false);
       setUrlInput('');
       setPipelineStep('idle');
@@ -451,7 +566,7 @@ export default function Page() {
       {/* Header Tabs */}
       <div className="flex items-center justify-between border-b border-border-main mb-8 overflow-hidden">
         <div className="flex gap-8 overflow-x-auto">
-          {(['chat', 'stats', 'profile', 'settings'] as const).map((tab) => (
+          {(['chat', 'stats', 'mindmap', 'profile', 'settings'] as const).map((tab) => (
             <button
               key={tab}
               id={`tab-${tab}`}
@@ -609,6 +724,30 @@ export default function Page() {
                     <Send size={18} />
                   </button>
                 </form>
+              </div>
+            </motion.div>
+          )}
+
+          {activeTab === 'mindmap' && (
+            <motion.div 
+              key="mindmap"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="h-full flex flex-col gap-6"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3 text-text-active">
+                  <Share2 size={18} strokeWidth={2.5} />
+                  <h2 className="text-sm font-black uppercase tracking-[0.3em]">Knowledge Structure Mindmap</h2>
+                </div>
+                <div className="text-[10px] font-bold text-text-dim uppercase tracking-widest">
+                  {crawledData.size} Connected Nodes
+                </div>
+              </div>
+
+              <div className="flex-1 overflow-hidden">
+                <MindmapView data={crawledData} />
               </div>
             </motion.div>
           )}
@@ -1057,17 +1196,16 @@ export default function Page() {
               <div className="flex items-center justify-between mb-8 px-4">
                 {[
                   { step: 'fetching', label: 'FETCH' },
-                  { step: 'review_raw', label: 'REVIEW' },
-                  { step: 'processing_ai', label: 'AI_MODEL' },
-                  { step: 'review_processed', label: 'KNOWLEDGE' },
-                  { step: 'chunking', label: 'CHUNKS' }
+                  { step: 'review_root', label: 'SELECT_LINKS' },
+                  { step: 'crawling', label: 'CRAWL' },
+                  { step: 'review_crawl', label: 'VERIFY_GRAPH' },
+                  { step: 'processing_ai', label: 'EXTRACT' },
+                  { step: 'review_ai', label: 'APPROVE_FACTS' },
                 ].map((s, idx, arr) => {
-                  const isActive = pipelineStep === s.step || 
-                    (s.step === 'fetching' && pipelineStep !== 'idle') ||
-                    (s.step === 'review_raw' && !['idle', 'fetching'].includes(pipelineStep)) ||
-                    (s.step === 'processing_ai' && !['idle', 'fetching', 'review_raw'].includes(pipelineStep)) ||
-                    (s.step === 'review_processed' && !['idle', 'fetching', 'review_raw', 'processing_ai'].includes(pipelineStep)) ||
-                    (s.step === 'chunking' && pipelineStep === 'finished');
+                  const stepOrder = ['idle', 'fetching', 'review_root', 'crawling', 'review_crawl', 'processing_ai', 'review_ai', 'finished'];
+                  const currentIdx = stepOrder.indexOf(pipelineStep);
+                  const sIdx = stepOrder.indexOf(s.step as any);
+                  const isActive = currentIdx >= sIdx && pipelineStep !== 'idle';
                   
                   return (
                     <React.Fragment key={s.step}>
@@ -1115,77 +1253,324 @@ export default function Page() {
                         </div>
                         <div className="flex flex-col items-center gap-2">
                           <span className="text-xs font-black uppercase tracking-[0.3em] text-text-active">Playwright_Navigation_Active</span>
-                          <span className="text-[9px] font-mono text-text-dim uppercase tracking-tighter">Target: {urlInput}</span>
+                          <span className="text-[9px] font-mono text-text-dim uppercase tracking-tighter transition-all">Target: {urlInput}</span>
                         </div>
                       </div>
                     )}
 
-                    {pipelineStep === 'review_raw' && (
+                    {pipelineStep === 'crawling' && (
                       <div className="space-y-6">
+                        <div className="flex flex-col items-center justify-center py-6 gap-2">
+                          <Loader2 className="animate-spin text-accent" size={24} />
+                          <span className="text-xs font-black uppercase tracking-[0.3em] text-text-active">Recursive_Crawl_In_Progress</span>
+                          <span className="text-[9px] font-mono text-accent animate-pulse truncate max-w-md">VISITING: {currentCrawlingUrl}</span>
+                        </div>
+                        
+                        <div className="space-y-3">
+                          <div className="flex justify-between items-center px-1">
+                            <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Discovered Nodes</h4>
+                            <span className="text-[10px] font-mono text-accent">{visitedUrls.size} Found</span>
+                          </div>
+                          <div className="grid grid-cols-1 gap-2 max-h-64 overflow-y-auto pr-2">
+                            {Array.from(crawledData.values()).map((page, i) => (
+                              <motion.div 
+                                initial={{ x: -10, opacity: 0 }}
+                                animate={{ x: 0, opacity: 1 }}
+                                key={page.url} 
+                                className="p-3 border-2 border-border-main/10 bg-bg-primary flex items-center gap-4 group"
+                              >
+                                <div className="w-6 h-6 rounded-full bg-accent/20 flex items-center justify-center text-[10px] font-bold text-accent">
+                                  {i + 1}
+                                </div>
+                                <div className="flex-1 overflow-hidden">
+                                  <div className="text-[11px] font-bold text-text-active truncate uppercase tracking-tight">{page.title}</div>
+                                  <div className="text-[9px] font-mono text-text-dim truncate">{page.url}</div>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <div className="w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]" />
+                                  <span className="text-[8px] font-black uppercase text-green-500 tracking-widest">Fetched</span>
+                                </div>
+                              </motion.div>
+                            ))}
+                            {currentCrawlingUrl && (
+                               <div className="p-3 border-2 border-dashed border-accent/20 bg-accent/5 flex items-center gap-4 animate-pulse">
+                                  <div className="w-6 h-6 rounded-full border border-accent flex items-center justify-center text-[10px] font-bold text-accent">
+                                    <Loader2 size={12} className="animate-spin" />
+                                  </div>
+                                  <div className="flex-1 overflow-hidden opacity-50">
+                                    <div className="text-[11px] font-bold text-accent truncate uppercase tracking-tight">Accessing Resource...</div>
+                                    <div className="text-[9px] font-mono text-accent truncate">{currentCrawlingUrl}</div>
+                                  </div>
+                               </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {pipelineStep === 'review_root' && (
+                      <div className="space-y-6">
+                        <div className="p-4 border-2 border-accent/20 bg-accent/5 flex items-center gap-4">
+                           <div className="w-12 h-12 rounded-full bg-accent flex items-center justify-center text-bg-primary">
+                             <Share2 size={24} />
+                           </div>
+                           <div className="flex-1">
+                             <h4 className="text-sm font-black uppercase text-accent tracking-widest">Discovery Phase Complete</h4>
+                             <p className="text-[10px] font-mono text-text-dim">Discovered {crawledData.get(urlInput)?.links.length || 0} candidate links for crawling.</p>
+                           </div>
+                        </div>
+
                         {scrapingScreenshot && (
                           <div className="space-y-2">
-                            <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Browser Snapshot (Final State)</h4>
-                            <div className="border-4 border-border-main/5 bg-bg-primary aspect-video overflow-hidden group/snap relative">
-                              <img 
-                                src={scrapingScreenshot} 
-                                alt="Scraped page snapshot" 
-                                className="w-full h-full object-cover object-top grayscale hover:grayscale-0 transition-all duration-700 cursor-zoom-in"
-                                onClick={() => window.open(scrapingScreenshot, '_blank')}
-                              />
-                              <div className="absolute bottom-4 right-4 bg-bg-primary/80 backdrop-blur px-3 py-1 text-[10px] font-black uppercase tracking-widest border border-border-main">
-                                Captured @ network_idle
-                              </div>
+                            <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Root Node Preview</h4>
+                            <div className="border-2 border-border-main/10 aspect-video overflow-hidden">
+                              <img src={scrapingScreenshot} className="w-full h-full object-cover" />
                             </div>
                           </div>
                         )}
-                        <div className="space-y-2">
+
+                        <div className="space-y-3">
                           <div className="flex items-center justify-between">
-                            <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Extracted Text Content</h4>
-                            <span className="text-[9px] font-mono opacity-50">{rawFetchedText.length} characters</span>
+                            <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Discovered Links ({selectedLinksForCrawl.size} Selected)</h4>
+                            <div className="flex gap-2">
+                               <button 
+                                 onClick={() => setSelectedLinksForCrawl(new Set((crawledData.get(urlInput)?.links || []).map(l => l.href)))}
+                                 className="text-[8px] font-black uppercase text-accent underline"
+                               >
+                                 Select All
+                               </button>
+                               <button 
+                                 onClick={() => setSelectedLinksForCrawl(new Set())}
+                                 className="text-[8px] font-black uppercase text-text-dim underline"
+                               >
+                                 Deselect All
+                               </button>
+                            </div>
                           </div>
-                          <div className="bg-bg-primary p-4 border-2 border-border-main/10 text-xs leading-relaxed text-text-dim font-mono h-48 overflow-y-auto">
-                            {rawFetchedText}
+                          <div className="max-h-48 overflow-y-auto border border-border-main/10 bg-bg-primary p-2 space-y-1">
+                            {crawledData.get(urlInput)?.links.map((link, i) => (
+                              <div 
+                                key={i} 
+                                className="flex items-center gap-2 py-1 border-b border-border-main/5 group cursor-pointer"
+                                onClick={() => {
+                                  const next = new Set(selectedLinksForCrawl);
+                                  if (next.has(link.href)) next.delete(link.href);
+                                  else next.add(link.href);
+                                  setSelectedLinksForCrawl(next);
+                                }}
+                              >
+                                <div className={cn(
+                                  "w-3 h-3 border transition-colors flex items-center justify-center flex-shrink-0",
+                                  selectedLinksForCrawl.has(link.href) ? "bg-accent border-accent" : "border-border-main"
+                                )}>
+                                  {selectedLinksForCrawl.has(link.href) && <div className="w-1.5 h-1.5 bg-bg-primary" />}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                   <div className={cn(
+                                     "text-[10px] font-bold uppercase truncate",
+                                     selectedLinksForCrawl.has(link.href) ? "text-text-active" : "text-text-dim"
+                                   )}>
+                                     {link.text}
+                                   </div>
+                                   <div className="text-[8px] font-mono text-text-dim/50 truncate">
+                                     {link.href}
+                                   </div>
+                                </div>
+                              </div>
+                            ))}
                           </div>
                         </div>
+
+                        <div className="flex gap-4 pt-4">
+                          <button 
+                            onClick={() => {
+                              const links = Array.from(selectedLinksForCrawl);
+                              setPipelineStep('crawling');
+                              startMultiCrawl(links, urlInput);
+                            }}
+                            disabled={selectedLinksForCrawl.size === 0}
+                            className="flex-1 py-4 bg-accent text-bg-primary font-black uppercase tracking-[0.2em] text-[10px] hover:scale-[1.02] transition-all flex items-center justify-center gap-2 disabled:opacity-30"
+                          >
+                            <Activity size={14} /> Start Global Crawl
+                          </button>
+                          <button 
+                            onClick={() => processAllCrawledData(crawledData)}
+                            className="flex-1 py-4 bg-bg-secondary border-2 border-border-main text-text-active font-black uppercase tracking-[0.2em] text-[10px] hover:bg-border-main/10 transition-all flex items-center justify-center gap-2"
+                          >
+                            <ArrowRight size={14} /> Skip to AI Extraction
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {pipelineStep === 'review_crawl' && (
+                      <div className="space-y-6">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <CheckCircle2 className="text-green-500" size={18} />
+                            <h4 className="text-sm font-black uppercase tracking-widest text-text-active">Crawl Operation Finalized</h4>
+                          </div>
+                          <span className="text-[10px] font-mono text-accent bg-accent/10 px-2 py-1">{visitedUrls.size} Nodes Verified</span>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4 max-h-64 overflow-y-auto pr-2">
+                           {Array.from(crawledData.values()).map(page => (
+                             <div 
+                               key={page.url} 
+                               className={cn(
+                                 "p-3 border transition-all cursor-pointer flex items-center gap-3",
+                                 selectedNodeUrl === page.url ? "border-accent bg-accent/5" : "border-border-main/20 bg-bg-primary hover:border-border-main"
+                               )}
+                               onClick={() => setSelectedNodeUrl(page.url === selectedNodeUrl ? null : page.url)}
+                             >
+                               <div className="w-8 h-8 rounded bg-bg-secondary flex-shrink-0 flex items-center justify-center">
+                                 {page.screenshot ? <img src={page.screenshot} className="w-full h-full object-cover opacity-50" /> : <FileText size={14} className="text-text-dim" />}
+                               </div>
+                               <div className="flex-1 overflow-hidden">
+                                 <div className="text-[10px] font-bold truncate uppercase">{page.title}</div>
+                                 <div className="text-[8px] font-mono text-text-dim truncate">{page.url}</div>
+                               </div>
+                             </div>
+                           ))}
+                        </div>
+
+                        {selectedNodeUrl && (
+                          <motion.div 
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="p-4 border-2 border-accent bg-bg-primary space-y-4"
+                          >
+                            <div className="flex items-center justify-between">
+                              <h5 className="text-[9px] font-black uppercase tracking-[0.2em] text-accent">Node_Payload_Preview</h5>
+                              <button onClick={() => setSelectedNodeUrl(null)}><X size={14} /></button>
+                            </div>
+                            <div className="text-[10px] font-mono text-text-dim leading-relaxed h-32 overflow-y-auto">
+                              {crawledData.get(selectedNodeUrl)?.text}
+                            </div>
+                          </motion.div>
+                        )}
+
+                        <div className="p-4 bg-accent/5 border border-accent/20 rounded">
+                           <p className="text-[10px] font-mono leading-relaxed text-text-active">
+                             Ready to fragment and process these nodes through the Gemini Neural Network.
+                             This will extract technical facts and build your local knowledge base.
+                           </p>
+                        </div>
+
+                        <button 
+                          onClick={handleProceedToAi}
+                          className="w-full py-4 bg-accent text-bg-primary font-black uppercase tracking-[0.3em] text-[11px] hover:scale-[1.01] transition-all flex items-center justify-center gap-2 shadow-xl"
+                        >
+                          <Cpu size={16} /> Execute Neural Extraction
+                        </button>
                       </div>
                     )}
 
                     {pipelineStep === 'processing_ai' && (
-                      <div className="flex flex-col items-center justify-center py-20 gap-4">
-                        <Loader2 className="animate-spin text-accent" size={32} />
-                        <span className="text-xs font-black uppercase tracking-[0.3em] text-text-active">Gemini_Core processing knowledge...</span>
+                      <div className="flex flex-col items-center justify-center py-20 gap-8 text-center">
+                        <div className="relative w-24 h-24 mx-auto">
+                           <div className="absolute inset-0 rounded-full border-4 border-accent animate-ping opacity-20" />
+                           <div className="absolute inset-2 rounded-full border-4 border-accent animate-pulse opacity-50" />
+                           <div className="absolute inset-0 flex items-center justify-center">
+                              <Cpu size={32} className="text-accent" />
+                           </div>
+                        </div>
+                        <div className="flex flex-col items-center gap-3">
+                           <span className="text-xs font-black uppercase tracking-[0.4em] text-text-active animate-pulse">Autonomous_Content_Extraction</span>
+                           <span className="text-[10px] font-mono text-accent uppercase">NODE: {currentProcessingUrl}</span>
+                        </div>
+                        <div className="w-full max-w-sm mx-auto h-1 bg-bg-secondary rounded-full overflow-hidden border border-border-main/20">
+                           <motion.div 
+                              className="h-full bg-accent"
+                              initial={{ width: 0 }}
+                              animate={{ width: '100%' }}
+                              transition={{ duration: 3, repeat: Infinity }}
+                           />
+                        </div>
+                        <div className="flex items-center justify-center gap-4 text-[10px] font-black uppercase tracking-widest text-text-dim bg-bg-secondary/50 px-4 py-2 rounded-full mx-auto">
+                           <Activity size={12} className="text-accent" />
+                           {Array.from(crawledData.values()).filter(d => d.processedText).length} / {crawledData.size} NODES_FINALIZED
+                        </div>
                       </div>
                     )}
 
-                    {pipelineStep === 'review_processed' && (
-                      <div className="space-y-4">
+                    {pipelineStep === 'review_ai' && (
+                      <div className="space-y-6">
                         <div className="flex items-center justify-between">
-                          <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Synthesized Knowledge Base</h4>
-                          <span className="text-[9px] font-mono opacity-50">OPTIMIZED_STRUCTURE</span>
+                          <h4 className="text-sm font-black uppercase tracking-widest text-text-active">Extracted Facts Approval</h4>
+                          <span className="text-[10px] font-mono text-accent">{Array.from(crawledData.values()).reduce((acc, curr) => acc + curr.chunks.length, 0)} Total Facts</span>
                         </div>
-                        <div className="bg-bg-primary p-4 border-2 border-border-main/10 text-xs leading-relaxed text-text-active h-64 overflow-y-auto markdown-body">
-                          <ReactMarkdown>{processedAiText}</ReactMarkdown>
-                        </div>
-                      </div>
-                    )}
 
-                    {pipelineStep === 'chunking' && (
-                      <div className="flex flex-col items-center justify-center py-20 gap-4">
-                        <Loader2 className="animate-spin text-accent" size={32} />
-                        <span className="text-xs font-black uppercase tracking-[0.3em] text-text-active">Fragmenting knowledge vectors...</span>
+                        <div className="space-y-4 max-h-[50vh] overflow-y-auto pr-2">
+                           {Array.from(crawledData.values()).map((page, pIdx) => (
+                             <div key={page.url} className="space-y-3 p-4 border-2 border-border-main/10 bg-bg-primary">
+                               <div className="flex items-center justify-between border-b border-border-main/5 pb-2">
+                                 <h5 className="text-[10px] font-black uppercase text-accent truncate max-w-[70%]">{page.title}</h5>
+                                 <span className="text-[8px] font-mono opacity-50">{page.chunks.length} chunks</span>
+                               </div>
+                               <div className="grid grid-cols-1 gap-2">
+                                 {page.chunks.map((chunk, cIdx) => (
+                                   <div key={chunk.id} className="p-2 bg-bg-secondary text-[10px] leading-relaxed group relative">
+                                      <span className="font-bold text-accent">#{cIdx+1}:</span> {chunk.text}
+                                      <button 
+                                        onClick={() => {
+                                           const next = new Map(crawledData);
+                                           const pageData = next.get(page.url);
+                                           if (pageData) {
+                                              pageData.chunks = pageData.chunks.filter(c => c.id !== chunk.id);
+                                              setCrawledData(next);
+                                           }
+                                        }}
+                                        className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 p-1 text-red-500 hover:bg-red-500/10 transition-all"
+                                      >
+                                        <Trash2 size={12} />
+                                      </button>
+                                   </div>
+                                 ))}
+                               </div>
+                               {page.chunks.length === 0 && <p className="text-[9px] italic text-red-500/50 text-center">No facts extracted for this node.</p>}
+                             </div>
+                           ))}
+                        </div>
+
+                        <div className="flex gap-4">
+                           <button 
+                             onClick={() => setPipelineStep('finished')}
+                             className="flex-1 py-4 bg-accent text-bg-primary font-black uppercase tracking-[0.2em] text-[10px] hover:scale-[1.01] transition-all flex items-center justify-center gap-2 shadow-xl"
+                           >
+                             <CheckCircle2 size={14} /> Approve All & Finalize
+                           </button>
+                           <button 
+                             onClick={() => setPipelineStep('review_crawl')}
+                             className="px-8 py-4 bg-bg-secondary border-2 border-border-main text-text-dim font-black uppercase tracking-[0.2em] text-[10px] hover:text-text-active transition-all"
+                           >
+                             Back
+                           </button>
+                        </div>
                       </div>
                     )}
 
                     {pipelineStep === 'finished' && (
-                      <div className="space-y-4">
+                      <div className="space-y-6">
                         <div className="flex items-center justify-between">
-                          <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Generated Document Chunks</h4>
-                          <span className="text-[9px] font-black bg-accent text-bg-primary px-2 py-0.5">{pipelineChunks.length} FRAGMENTS</span>
+                          <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Generated Knowledge Fragments</h4>
+                          <span className="text-[9px] font-black bg-accent text-bg-primary px-2 py-0.5">{Array.from(crawledData.values()).reduce((acc, curr) => acc + curr.chunks.length, 0)} TOTAL CHUNKS</span>
                         </div>
-                        <div className="space-y-2">
-                          {pipelineChunks.map((chunk, i) => (
-                            <div key={chunk.id} className="p-3 border-2 border-border-main/10 bg-bg-primary text-[11px] leading-relaxed text-text-dim">
-                              <span className="font-black text-accent mr-2">CH_{i+1}:</span> {chunk.text}
+                        <div className="space-y-6">
+                          {Array.from(crawledData.values()).map((page, pIdx) => (
+                            <div key={page.url} className="space-y-2">
+                               <div className="flex items-center gap-2">
+                                 <div className="px-2 py-0.5 bg-bg-secondary border border-border-main text-[9px] font-black uppercase tracking-tighter text-text-dim">
+                                   Source_{pIdx+1}: {page.title}
+                                 </div>
+                               </div>
+                               <div className="space-y-2 pl-4 border-l-2 border-border-main/20">
+                                {page.chunks.map((chunk, i) => (
+                                  <div key={chunk.id} className="p-3 border border-border-main/10 bg-bg-primary text-[11px] leading-relaxed text-text-dim">
+                                    <span className="font-black text-accent mr-2">CH_{i+1}:</span> {chunk.text.slice(0, 200)}{chunk.text.length > 200 ? '...' : ''}
+                                  </div>
+                                ))}
+                               </div>
                             </div>
                           ))}
                         </div>
@@ -1198,22 +1583,6 @@ export default function Page() {
               {/* Modal Footer Controls */}
               {!pipelineError && (
                 <div className="flex justify-end pt-6 border-t-2 border-border-main gap-4">
-                  {pipelineStep === 'review_raw' && (
-                    <button 
-                      onClick={handleAiProcess}
-                      className="px-8 py-3 bg-text-active text-bg-primary hover:bg-bg-primary hover:text-text-active border-2 border-text-active transition-all text-xs font-black uppercase tracking-widest flex items-center gap-2"
-                    >
-                      Process with AI <ArrowRight size={14} />
-                    </button>
-                  )}
-                  {pipelineStep === 'review_processed' && (
-                    <button 
-                      onClick={handleGenerateChunks}
-                      className="px-8 py-3 bg-text-active text-bg-primary hover:bg-bg-primary hover:text-text-active border-2 border-text-active transition-all text-xs font-black uppercase tracking-widest flex items-center gap-2"
-                    >
-                      Generate Chunks <ArrowRight size={14} />
-                    </button>
-                  )}
                   {pipelineStep === 'finished' && (
                     <button 
                       onClick={handleSavePipelineChunks}

@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 
 export async function GET() {
-  const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY || process.env.NEXT_PUBLIC_GEMINI_API_KEY;
   
   if (!apiKey) {
     return NextResponse.json({ error: 'API Key not configured' }, { status: 500 });
@@ -41,16 +41,9 @@ export async function GET() {
               description: 'Complex reasoning and high creativity',
               inputTokenLimit: 2097152,
               outputTokenLimit: 8192,
-            },
-            {
-              name: 'gemini-3.1-flash-lite',
-              displayName: 'Gemini 3.1 Flash Lite',
-              description: 'Optimized for low latency and efficiency',
-              inputTokenLimit: 1048576,
-              outputTokenLimit: 8192,
             }
           ],
-          warning: 'API Key restricted. Using fallback models.' 
+          warning: 'API Key restricted or invalid for model list endpoint. Using fallback models.' 
         });
       }
       throw new Error(`Failed to fetch models: ${errorMsg}`);
@@ -87,13 +80,6 @@ export async function GET() {
           displayName: 'Gemini 3.1 Pro',
           description: 'Complex reasoning and high creativity',
           inputTokenLimit: 2097152,
-          outputTokenLimit: 8192,
-        },
-        {
-          name: 'gemini-3.1-flash-lite',
-          displayName: 'Gemini 3.1 Flash Lite',
-          description: 'Optimized for low latency and efficiency',
-          inputTokenLimit: 1048576,
           outputTokenLimit: 8192,
         }
       ],
