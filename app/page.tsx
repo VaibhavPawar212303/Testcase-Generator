@@ -85,9 +85,14 @@ export default function Page() {
   const [editingMessageText, setEditingMessageText] = useState('');
   
   // Model Settings
-  const [selectedModel, setSelectedModel] = useState('gemini-1.5-flash');
+  const [selectedModel, setSelectedModel] = useState('gemini-3-flash-preview');
   const [availableModels, setAvailableModels] = useState<any[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [tokenUsage, setTokenUsage] = useState({
+    promptTokens: 0,
+    candidatesTokens: 0,
+    totalTokens: 0
+  });
   
   // Pipeline States
   const [pipelineStep, setPipelineStep] = useState<'idle' | 'fetching' | 'review_raw' | 'processing_ai' | 'review_processed' | 'chunking' | 'finished'>('idle');
@@ -96,6 +101,7 @@ export default function Page() {
   const [pipelineChunks, setPipelineChunks] = useState<{ id: string; text: string }[]>([]);
   const [showPipelineModal, setShowPipelineModal] = useState(false);
   const [pipelineError, setPipelineError] = useState<string | null>(null);
+  const [scrapingScreenshot, setScrapingScreenshot] = useState<string | null>(null);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
 
@@ -149,9 +155,16 @@ export default function Page() {
       const data = await res.json();
       if (data.models) {
         setAvailableModels(data.models);
+      } else if (data.error) {
+        throw new Error(data.error);
       }
     } catch (e) {
       console.error("Failed to fetch models", e);
+      setMessages(prev => [...prev, { 
+        id: Date.now().toString(), 
+        role: 'system', 
+        content: `// NODE_DISCOVERY_FAILED: [${(e as Error).message}]` 
+      }]);
     } finally {
       setIsFetchingModels(false);
     }
@@ -210,6 +223,7 @@ export default function Page() {
     setRawFetchedText('');
     setProcessedAiText('');
     setPipelineChunks([]);
+    setScrapingScreenshot(null);
 
     try {
       const response = await fetch('/api/fetch-url', {
@@ -230,6 +244,9 @@ export default function Page() {
       if (data.error) throw new Error(data.error);
 
       setRawFetchedText(data.text);
+      if (data.screenshot) {
+        setScrapingScreenshot(data.screenshot);
+      }
       setPipelineStep('review_raw');
     } catch (err) {
       console.error("URL Fetch failed", err);
@@ -241,7 +258,7 @@ export default function Page() {
     setPipelineStep('processing_ai');
     setPipelineError(null);
     try {
-      const extraction = await ai.models.generateContent({
+      const result = await ai.models.generateContent({
         model: selectedModel,
         contents: `Extract the most important technical or factual information from this raw text and format it as a consolidated, clean knowledge base text. Focus on facts and useful details.\n\nRAW TEXT:\n${rawFetchedText}`,
         config: {
@@ -249,7 +266,16 @@ export default function Page() {
         }
       });
       
-      setProcessedAiText(extraction.text);
+      if (result.usageMetadata) {
+        setTokenUsage(prev => ({
+          promptTokens: prev.promptTokens + (result.usageMetadata?.promptTokenCount || 0),
+          candidatesTokens: prev.candidatesTokens + (result.usageMetadata?.candidatesTokenCount || 0),
+          totalTokens: prev.totalTokens + (result.usageMetadata?.totalTokenCount || 0)
+        }));
+      }
+      
+      const extractedText = result.text || "";
+      setProcessedAiText(extractedText);
       setPipelineStep('review_processed');
     } catch (err) {
       console.error("AI Processing failed", err);
@@ -385,7 +411,7 @@ export default function Page() {
         ? rankedDocs.map(d => `[SOURCE: ${d.metadata.source}]\n${d.text}`).join('\n\n')
         : "No relevant documents found in knowledge base.";
 
-      const response = await ai.models.generateContent({
+      const result = await ai.models.generateContent({
         model: selectedModel,
         contents: `You are a RAG Knowledge Terminal. Answer the user prompt based strictly on the provided knowledge base context. If the answer is not in the context, say you don't know based on human data.\n\nCONTEXT:\n${context}\n\nUSER PROMPT:\n${userMsg.content}`,
         config: {
@@ -393,10 +419,18 @@ export default function Page() {
         }
       });
 
+      if (result.usageMetadata) {
+        setTokenUsage(prev => ({
+          promptTokens: prev.promptTokens + (result.usageMetadata?.promptTokenCount || 0),
+          candidatesTokens: prev.candidatesTokens + (result.usageMetadata?.candidatesTokenCount || 0),
+          totalTokens: prev.totalTokens + (result.usageMetadata?.totalTokenCount || 0)
+        }));
+      }
+
       const assistantMsg: ChatMessage = { 
         id: (Date.now() + 1).toString(), 
         role: 'assistant', 
-        content: response.text,
+        content: result.text || "No response generated.",
         retrievalContext: rankedDocs.map(d => ({ text: d.text, source: d.metadata.source, score: d.score }))
       };
       setMessages(prev => [...prev, assistantMsg]);
@@ -777,14 +811,14 @@ export default function Page() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   {/* Active Processing Node Selection */}
                   <div className="space-y-4">
-                    <h3 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Active Intelligence Node</h3>
+                    <h3 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Active Intelligence Node (Top 5)</h3>
                     <div className="space-y-2">
                       {isFetchingModels ? (
-                        Array.from({ length: 3 }).map((_, i) => (
+                        Array.from({ length: 5 }).map((_, i) => (
                           <div key={i} className="h-16 border-2 border-border-main/10 bg-bg-secondary animate-pulse" />
                         ))
                       ) : (
-                        availableModels.map((model) => (
+                        availableModels.slice(0, 5).map((model) => (
                           <button
                             key={model.name}
                             onClick={() => setSelectedModel(model.name)}
@@ -826,6 +860,38 @@ export default function Page() {
                         <div className="flex items-center gap-2 text-accent">
                           <Activity size={14} />
                           <span className="text-[10px] font-black uppercase tracking-widest underline">NODE_STATUS: STABLE</span>
+                        </div>
+
+                        {/* Usage Statistics */}
+                        <div className="space-y-3 pt-2">
+                          <h4 className="text-[9px] font-black uppercase tracking-widest text-text-active flex items-center gap-2">
+                            <Send size={10} /> Usage Statistics
+                          </h4>
+                          <div className="grid grid-cols-2 gap-2">
+                            <div className="p-3 bg-bg-primary border border-border-main/20">
+                              <div className="text-[8px] font-bold text-text-dim uppercase mb-1">Total Tokens Used</div>
+                              <div className="text-sm font-black text-text-active">{tokenUsage.totalTokens.toLocaleString()}</div>
+                            </div>
+                            <div className="p-3 bg-bg-primary border border-border-main/20">
+                              <div className="text-[8px] font-bold text-text-dim uppercase mb-1">Pending Capacity</div>
+                              <div className="text-sm font-black text-accent">
+                                {availableModels.find(m => m.name === selectedModel) 
+                                  ? (availableModels.find(m => m.name === selectedModel).inputTokenLimit - tokenUsage.promptTokens).toLocaleString()
+                                  : "---"
+                                }
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex gap-4 px-1">
+                            <div className="flex flex-col">
+                              <span className="text-[8px] font-bold text-text-dim uppercase">Prompt</span>
+                              <span className="text-[10px] font-mono text-text-active">{tokenUsage.promptTokens.toLocaleString()}</span>
+                            </div>
+                            <div className="flex flex-col">
+                              <span className="text-[8px] font-bold text-text-dim uppercase">Candidates</span>
+                              <span className="text-[10px] font-mono text-text-active">{tokenUsage.candidatesTokens.toLocaleString()}</span>
+                            </div>
+                          </div>
                         </div>
                         
                         {availableModels.find(m => m.name === selectedModel) && (
@@ -1039,20 +1105,47 @@ export default function Page() {
                 ) : (
                   <>
                     {pipelineStep === 'fetching' && (
-                      <div className="flex flex-col items-center justify-center py-20 gap-4">
-                        <Loader2 className="animate-spin text-accent" size={32} />
-                        <span className="text-xs font-black uppercase tracking-[0.3em] text-text-active">Retrieving Remote Content...</span>
+                      <div className="flex flex-col items-center justify-center py-10 gap-6">
+                        <div className="relative w-full max-w-lg aspect-video bg-bg-primary border-2 border-border-main/20 flex flex-col items-center justify-center overflow-hidden">
+                          <Loader2 className="animate-spin text-accent absolute z-10" size={32} />
+                          <div className="w-full h-full bg-bg-secondary opacity-50 flex items-center justify-center flex-col gap-2">
+                             <Search size={48} className="text-text-dim opacity-20" />
+                             <span className="text-[10px] font-mono text-text-dim uppercase">Initializing Headless Node...</span>
+                          </div>
+                        </div>
+                        <div className="flex flex-col items-center gap-2">
+                          <span className="text-xs font-black uppercase tracking-[0.3em] text-text-active">Playwright_Navigation_Active</span>
+                          <span className="text-[9px] font-mono text-text-dim uppercase tracking-tighter">Target: {urlInput}</span>
+                        </div>
                       </div>
                     )}
 
                     {pipelineStep === 'review_raw' && (
-                      <div className="space-y-4">
-                        <div className="flex items-center justify-between">
-                          <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Raw Fetched Details</h4>
-                          <span className="text-[9px] font-mono opacity-50">{rawFetchedText.length} characters</span>
-                        </div>
-                        <div className="bg-bg-primary p-4 border-2 border-border-main/10 text-xs leading-relaxed text-text-dim font-mono h-64 overflow-y-auto">
-                          {rawFetchedText}
+                      <div className="space-y-6">
+                        {scrapingScreenshot && (
+                          <div className="space-y-2">
+                            <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Browser Snapshot (Final State)</h4>
+                            <div className="border-4 border-border-main/5 bg-bg-primary aspect-video overflow-hidden group/snap relative">
+                              <img 
+                                src={scrapingScreenshot} 
+                                alt="Scraped page snapshot" 
+                                className="w-full h-full object-cover object-top grayscale hover:grayscale-0 transition-all duration-700 cursor-zoom-in"
+                                onClick={() => window.open(scrapingScreenshot, '_blank')}
+                              />
+                              <div className="absolute bottom-4 right-4 bg-bg-primary/80 backdrop-blur px-3 py-1 text-[10px] font-black uppercase tracking-widest border border-border-main">
+                                Captured @ network_idle
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between">
+                            <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Extracted Text Content</h4>
+                            <span className="text-[9px] font-mono opacity-50">{rawFetchedText.length} characters</span>
+                          </div>
+                          <div className="bg-bg-primary p-4 border-2 border-border-main/10 text-xs leading-relaxed text-text-dim font-mono h-48 overflow-y-auto">
+                            {rawFetchedText}
+                          </div>
                         </div>
                       </div>
                     )}

@@ -8,16 +8,58 @@ export async function GET() {
   }
 
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+    // Log sanitized key for debugging
+    const sanitizedKey = apiKey ? `${apiKey.substring(0, 4)}...${apiKey.substring(apiKey.length - 4)}` : 'MISSING';
+    console.log(`Attempting to fetch models with key: ${sanitizedKey}`);
+
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models`, {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      }
+    });
     
     if (!response.ok) {
-      throw new Error(`Failed to fetch models: ${response.statusText}`);
+      const errorData = await response.json().catch(() => ({}));
+      const errorMsg = errorData.error?.message || response.statusText;
+      
+      // If unauthorized or bad request (invalid key for this endpoint), return fallback immediately without throwing
+      if (response.status === 400 || response.status === 401 || response.status === 403) {
+        console.warn(`Gemini API Model List failed (${response.status}): ${errorMsg}. Using fallback nodes.`);
+        return NextResponse.json({ 
+          models: [
+            {
+              name: 'gemini-3-flash-preview',
+              displayName: 'Gemini 3 Flash',
+              description: 'Next generation fast and versatile model',
+              inputTokenLimit: 1048576,
+              outputTokenLimit: 8192,
+            },
+            {
+              name: 'gemini-3.1-pro-preview',
+              displayName: 'Gemini 3.1 Pro',
+              description: 'Complex reasoning and high creativity',
+              inputTokenLimit: 2097152,
+              outputTokenLimit: 8192,
+            },
+            {
+              name: 'gemini-3.1-flash-lite',
+              displayName: 'Gemini 3.1 Flash Lite',
+              description: 'Optimized for low latency and efficiency',
+              inputTokenLimit: 1048576,
+              outputTokenLimit: 8192,
+            }
+          ],
+          warning: 'API Key restricted. Using fallback models.' 
+        });
+      }
+      throw new Error(`Failed to fetch models: ${errorMsg}`);
     }
 
     const data = await response.json();
     // Filter for models that support generating content
     const models = data.models
-      .filter((m: any) => m.supportedGenerationMethods.includes('generateContent'))
+      .filter((m: any) => m.supportedGenerationMethods.includes('generateContent') && !m.name.includes('vision') && !m.name.includes('embedding'))
       .map((m: any) => ({
         name: m.name.replace('models/', ''),
         displayName: m.displayName,
@@ -29,6 +71,33 @@ export async function GET() {
     return NextResponse.json({ models });
   } catch (error) {
     console.error('Error fetching models:', error);
-    return NextResponse.json({ error: 'Failed to fetch models' }, { status: 500 });
+    
+    // Final fallback if everything fails
+    return NextResponse.json({ 
+      models: [
+        {
+          name: 'gemini-3-flash-preview',
+          displayName: 'Gemini 3 Flash',
+          description: 'Next generation fast and versatile model',
+          inputTokenLimit: 1048576,
+          outputTokenLimit: 8192,
+        },
+        {
+          name: 'gemini-3.1-pro-preview',
+          displayName: 'Gemini 3.1 Pro',
+          description: 'Complex reasoning and high creativity',
+          inputTokenLimit: 2097152,
+          outputTokenLimit: 8192,
+        },
+        {
+          name: 'gemini-3.1-flash-lite',
+          displayName: 'Gemini 3.1 Flash Lite',
+          description: 'Optimized for low latency and efficiency',
+          inputTokenLimit: 1048576,
+          outputTokenLimit: 8192,
+        }
+      ],
+      warning: 'Using internal fallback models list.' 
+    });
   }
 }
