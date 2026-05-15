@@ -124,6 +124,10 @@ export default function Page() {
   const [visitedUrls, setVisitedUrls] = useState<Set<string>>(new Set());
   const [currentCrawlingUrl, setCurrentCrawlingUrl] = useState<string | null>(null);
   const [isCrawlingFinished, setIsCrawlingFinished] = useState(false);
+  const [crawlQueue, setCrawlQueue] = useState<string[]>([]);
+  const [currentQueueIndex, setCurrentQueueIndex] = useState(0);
+  const [isWaitingForNextReview, setIsWaitingForNextReview] = useState(false);
+  const [crawlError, setCrawlError] = useState<string | null>(null);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
 
@@ -299,59 +303,75 @@ export default function Page() {
     }
   };
 
-  const startMultiCrawl = async (initialQueue: string[], rootUrl: string) => {
-    const maxPages = 15; // Increased breadth for deeper knowledge
+  const startMultiCrawl = (initialQueue: string[], rootUrl: string) => {
+    const maxPages = 15;
     const queue = initialQueue.slice(0, maxPages - 1);
-    const visited = new Set([rootUrl]);
-    const newDataMap = new Map(crawledData);
+    setCrawlQueue(queue);
+    setCurrentQueueIndex(0);
+    setPipelineStep('crawling');
+    setIsWaitingForNextReview(false);
+    setCrawlError(null);
     
-    addLog(`STARTING_BREADTH_FIRST_CRAWL: LIMIT=${maxPages}_NODES`);
+    addLog(`STARTING_INTERACTIVE_CRAWL: QUEUE_SIZE=${queue.length}`);
+    fetchCrawlItem(queue[0], 0);
+  };
+
+  const fetchCrawlItem = async (url: string, index: number) => {
+    setCurrentCrawlingUrl(url);
+    setCrawlError(null);
+    addLog(`PLAYWRIGHT_DISPATCH [${index + 1}/${crawlQueue.length || '?' }]: TARGET=${url}`);
     
-    for (const url of queue) {
-      if (visited.has(url)) continue;
-      if (visited.size >= maxPages) break;
+    try {
+      const response = await fetch('/api/fetch-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url })
+      });
       
-      setCurrentCrawlingUrl(url);
-      addLog(`PLAYWRIGHT_DISPATCH: TARGET=${url}`);
-      try {
-        const response = await fetch('/api/fetch-url', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url })
-        });
-        
-        if (!response.ok) {
-           addLog(`FETCH_FAILED_FOR_NODE: ${url} (CODE: ${response.status})`);
-           continue;
-        }
-        const data = await response.json();
-        
-        visited.add(url);
-        newDataMap.set(url, {
-          url,
-          title: data.title || url,
-          text: data.text,
-          links: data.links || [],
-          processedText: '',
-          chunks: [],
-          screenshot: data.screenshot
-        });
-        
-        addLog(`NODE_INGESTED: ${data.title} || ${data.links?.length || 0}_LINKS`);
-        
-        // Progressively update state for UI feedback
-        setCrawledData(new Map(newDataMap));
-        setVisitedUrls(new Set(visited));
-      } catch (err) {
-        addLog(`STREAMS_ERROR_AT_NODE: ${url}`);
-        console.error(`Crawl failed for ${url}`, err);
+      if (!response.ok) {
+         const errData = await response.json().catch(() => ({ error: 'Connection Failed' }));
+         addLog(`FETCH_FAILED_FOR_NODE: ${url} (${errData.error})`);
+         setCrawlError(errData.error);
+         setIsWaitingForNextReview(true);
+         return;
       }
+      const data = await response.json();
+      
+      const newDataMap = new Map(crawledData);
+      newDataMap.set(url, {
+        url,
+        title: data.title || url,
+        text: data.text,
+        links: data.links || [],
+        processedText: '',
+        chunks: [],
+        screenshot: data.screenshot
+      });
+      
+      setCrawledData(newDataMap);
+      setVisitedUrls(prev => new Set([...prev, url]));
+      addLog(`NODE_INGESTED: ${data.title}`);
+      setIsWaitingForNextReview(true);
+    } catch (err) {
+      addLog(`STREAMS_ERROR_AT_NODE: ${url}`);
+      console.error(`Crawl failed for ${url}`, err);
+      setCrawlError((err as Error).message);
+      setIsWaitingForNextReview(true);
     }
-    
-    addLog(`CRAWL_FINISHED: ${visited.size}_NODES_IN_GRAPH`);
-    setCurrentCrawlingUrl(null);
-    setIsCrawlingFinished(true);
-    setPipelineStep('review_crawl');
+  };
+
+  const handleNextCrawl = () => {
+    const nextIndex = currentQueueIndex + 1;
+    if (nextIndex < crawlQueue.length) {
+      setCurrentQueueIndex(nextIndex);
+      setIsWaitingForNextReview(false);
+      fetchCrawlItem(crawlQueue[nextIndex], nextIndex);
+    } else {
+      addLog(`CRAWL_FINISHED: ${visitedUrls.size}_NODES_IN_GRAPH`);
+      setCurrentCrawlingUrl(null);
+      setIsCrawlingFinished(true);
+      setPipelineStep('review_crawl');
+    }
   };
 
   const handleProceedToAi = async () => {
@@ -1260,51 +1280,115 @@ export default function Page() {
 
                     {pipelineStep === 'crawling' && (
                       <div className="space-y-6">
-                        <div className="flex flex-col items-center justify-center py-6 gap-2">
-                          <Loader2 className="animate-spin text-accent" size={24} />
-                          <span className="text-xs font-black uppercase tracking-[0.3em] text-text-active">Recursive_Crawl_In_Progress</span>
-                          <span className="text-[9px] font-mono text-accent animate-pulse truncate max-w-md">VISITING: {currentCrawlingUrl}</span>
+                        <div className="flex flex-col items-center justify-center py-4 gap-2">
+                          {!isWaitingForNextReview ? (
+                            <Loader2 className="animate-spin text-accent" size={24} />
+                          ) : crawlError ? (
+                            <X className="text-red-500" size={24} />
+                          ) : (
+                            <CheckCircle2 className="text-green-500" size={24} />
+                          )}
+                          <span className="text-xs font-black uppercase tracking-[0.3em] text-text-active">
+                            {isWaitingForNextReview ? (crawlError ? 'FETCH_ERROR_OCCURRED' : 'URL_READY_FOR_REVIEW') : 'Recursive_Crawl_In_Progress'}
+                          </span>
+                          <span className="text-[9px] font-mono text-accent truncate max-w-md">
+                            {currentQueueIndex + 1} / {crawlQueue.length} : {currentCrawlingUrl}
+                          </span>
                         </div>
-                        
-                        <div className="space-y-3">
-                          <div className="flex justify-between items-center px-1">
-                            <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Discovered Nodes</h4>
-                            <span className="text-[10px] font-mono text-accent">{visitedUrls.size} Found</span>
-                          </div>
-                          <div className="grid grid-cols-1 gap-2 max-h-64 overflow-y-auto pr-2">
-                            {Array.from(crawledData.values()).map((page, i) => (
-                              <motion.div 
-                                initial={{ x: -10, opacity: 0 }}
-                                animate={{ x: 0, opacity: 1 }}
-                                key={page.url} 
-                                className="p-3 border-2 border-border-main/10 bg-bg-primary flex items-center gap-4 group"
-                              >
-                                <div className="w-6 h-6 rounded-full bg-accent/20 flex items-center justify-center text-[10px] font-bold text-accent">
-                                  {i + 1}
-                                </div>
-                                <div className="flex-1 overflow-hidden">
-                                  <div className="text-[11px] font-bold text-text-active truncate uppercase tracking-tight">{page.title}</div>
-                                  <div className="text-[9px] font-mono text-text-dim truncate">{page.url}</div>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  <div className="w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]" />
-                                  <span className="text-[8px] font-black uppercase text-green-500 tracking-widest">Fetched</span>
-                                </div>
-                              </motion.div>
-                            ))}
-                            {currentCrawlingUrl && (
-                               <div className="p-3 border-2 border-dashed border-accent/20 bg-accent/5 flex items-center gap-4 animate-pulse">
-                                  <div className="w-6 h-6 rounded-full border border-accent flex items-center justify-center text-[10px] font-bold text-accent">
-                                    <Loader2 size={12} className="animate-spin" />
+
+                        {/* Review Content if ready */}
+                        {isWaitingForNextReview && (
+                          <motion.div 
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className={cn(
+                              "p-4 border-2 bg-bg-primary space-y-4 shadow-xl",
+                              crawlError ? "border-red-500/50" : "border-accent"
+                            )}
+                          >
+                            {crawlError ? (
+                               <div className="space-y-4">
+                                  <div className="p-3 bg-red-500/10 border border-red-500/20 text-red-500 text-[10px] font-mono">
+                                    ERROR: {crawlError}
                                   </div>
-                                  <div className="flex-1 overflow-hidden opacity-50">
-                                    <div className="text-[11px] font-bold text-accent truncate uppercase tracking-tight">Accessing Resource...</div>
-                                    <div className="text-[9px] font-mono text-accent truncate">{currentCrawlingUrl}</div>
+                                  <p className="text-[10px] text-text-dim uppercase tracking-widest leading-relaxed">
+                                    This URL could not be processed. You can retry it or skip to the next URL in the queue.
+                                  </p>
+                                  <div className="flex gap-2">
+                                     <button 
+                                      onClick={() => {
+                                        setIsWaitingForNextReview(false);
+                                        fetchCrawlItem(crawlQueue[currentQueueIndex], currentQueueIndex);
+                                      }}
+                                      className="flex-1 py-3 border-2 border-red-500 text-red-500 text-[10px] font-black uppercase tracking-widest hover:bg-red-500 hover:text-bg-primary transition-all"
+                                     >
+                                       Retry URL
+                                     </button>
+                                     <button 
+                                      onClick={handleNextCrawl}
+                                      className="flex-1 py-3 bg-bg-secondary border-2 border-border-main text-text-dim text-[10px] font-black uppercase tracking-widest hover:text-text-active transition-all"
+                                     >
+                                       Skip URL
+                                     </button>
                                   </div>
                                </div>
+                            ) : (
+                               <div className="space-y-4">
+                                  <div className="flex items-center justify-between border-b border-border-main pb-2">
+                                    <h4 className="text-[10px] font-black uppercase text-accent truncate max-w-[80%]">
+                                      {crawledData.get(currentCrawlingUrl!)?.title}
+                                    </h4>
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-[9px] font-mono text-text-dim">{(crawledData.get(currentCrawlingUrl!)?.text || "").length.toLocaleString()} CHRS</span>
+                                    </div>
+                                  </div>
+                                  
+                                  {crawledData.get(currentCrawlingUrl!)?.screenshot && (
+                                    <div className="aspect-video w-full border border-border-main/20 overflow-hidden bg-bg-secondary">
+                                      <img src={crawledData.get(currentCrawlingUrl!)?.screenshot} className="w-full h-full object-contain" alt="Preview" />
+                                    </div>
+                                  )}
+
+                                  <div className="max-h-32 overflow-y-auto text-[10px] font-mono text-text-dim leading-relaxed p-2 bg-bg-secondary">
+                                    {crawledData.get(currentCrawlingUrl!)?.text.slice(0, 500)}...
+                                  </div>
+
+                                  <button
+                                    onClick={handleNextCrawl}
+                                    className="w-full py-4 bg-accent text-bg-primary font-black uppercase tracking-widest text-[10px] hover:scale-[1.02] transition-all flex items-center justify-center gap-2"
+                                  >
+                                    {currentQueueIndex + 1 < crawlQueue.length ? (
+                                      <>Review Done - Next URL <ArrowRight size={14} /></>
+                                    ) : (
+                                      <>Review Done - Finalize Crawl <CheckCircle2 size={14} /></>
+                                    )}
+                                  </button>
+                               </div>
                             )}
+                          </motion.div>
+                        )}
+                        
+                        {!isWaitingForNextReview && (
+                          <div className="space-y-3">
+                            <div className="flex justify-between items-center px-1">
+                              <h4 className="text-[10px] font-black uppercase tracking-widest text-text-dim">Discovered Nodes</h4>
+                              <span className="text-[10px] font-mono text-accent">{visitedUrls.size} Found</span>
+                            </div>
+                            <div className="grid grid-cols-1 gap-2 max-h-48 overflow-y-auto pr-2">
+                              {Array.from(crawledData.values()).map((page, i) => (
+                                <div key={page.url} className="p-3 border-2 border-border-main/10 bg-bg-primary flex items-center gap-4">
+                                  <div className="w-6 h-6 rounded-full bg-accent/20 flex items-center justify-center text-[10px] font-bold text-accent">
+                                    {i + 1}
+                                  </div>
+                                  <div className="flex-1 overflow-hidden">
+                                    <div className="text-[11px] font-bold text-text-active truncate uppercase tracking-tight">{page.title}</div>
+                                    <div className="text-[9px] font-mono text-text-dim truncate">{page.url}</div>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
                           </div>
-                        </div>
+                        )}
                       </div>
                     )}
 

@@ -76,18 +76,16 @@ export async function POST(req: Request) {
       // 'domcontentloaded' is much faster than 'load'
       await page.goto(url, { 
         waitUntil: 'domcontentloaded', 
-        timeout: 20000 // 20s for initial load
+        timeout: 30000 // Increased to 30s for slow sites
       });
     } catch (e) {
-      console.warn("Initial navigation timeout, attempting to proceed...");
+      console.warn("Initial navigation timeout, attempting to proceed with whatever is loaded...");
     }
     
-    // Optional: wait briefly for network to settle slightly 
+    // Optional: wait a bit for some content to appear if strictly needed
     try {
-      await page.waitForLoadState('load', { timeout: 3000 });
-    } catch (e) {
-      console.warn("Load state not reached, proceeding with current content.");
-    }
+      await page.waitForTimeout(1000); 
+    } catch (e) {}
     
     // Step 2: Extract content and links WHILE the page is stable
     const data = await page.evaluate(() => {
